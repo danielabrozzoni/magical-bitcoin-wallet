@@ -4,12 +4,18 @@ pub enum Error {
     MissingInputUTXO(usize),
     InvalidU32Bytes(Vec<u8>),
     Generic(String),
+    ScriptDoesntHaveAddressForm,
+
+    Descriptor(crate::descriptor::error::Error),
 
     Encode(bitcoin::consensus::encode::Error),
     BIP32(bitcoin::util::bip32::Error),
     Secp256k1(bitcoin::secp256k1::Error),
     JSON(serde_json::Error),
+    Hex(bitcoin::hashes::hex::Error),
 
+    #[cfg(any(feature = "electrum", feature = "default"))]
+    Electrum(electrum_client::Error),
     #[cfg(any(feature = "key-value-db", feature = "default"))]
     Sled(sled::Error),
 }
@@ -24,10 +30,15 @@ macro_rules! impl_error {
     };
 }
 
+impl_error!(crate::descriptor::error::Error, Descriptor);
+
 impl_error!(bitcoin::consensus::encode::Error, Encode);
 impl_error!(bitcoin::util::bip32::Error, BIP32);
 impl_error!(bitcoin::secp256k1::Error, Secp256k1);
 impl_error!(serde_json::Error, JSON);
+impl_error!(bitcoin::hashes::hex::Error, Hex);
 
+#[cfg(any(feature = "electrum", feature = "default"))]
+impl_error!(electrum_client::Error, Electrum);
 #[cfg(any(feature = "key-value-db", feature = "default"))]
 impl_error!(sled::Error, Sled);
