@@ -3,11 +3,13 @@ use std::cmp;
 use std::collections::{HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use bitcoin::consensus::encode::serialize;
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::util::bip32::{ChildNumber, DerivationPath};
-use bitcoin::{Address, Network, OutPoint, Script, TxOut, Txid};
+use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
+use bitcoin::{Address, Network, OutPoint, Script, SigHashType, Transaction, TxIn, TxOut, Txid};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -15,9 +17,9 @@ use log::{debug, error, info, trace};
 pub mod offline_stream;
 pub mod utils;
 
-use self::utils::ChunksIterator;
+use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::ExtendedDescriptor;
+use crate::descriptor::{DescriptorMeta, ExtendedDescriptor};
 use crate::error::Error;
 use crate::types::*;
 
@@ -78,10 +80,311 @@ where
         self.get_path(script).map(|x| x.is_some())
     }
 
+    pub fn list_unspent(&self) -> Result<Vec<UTXO>, Error> {
+        self.database.borrow().iter_utxos()
+    }
+
+    pub fn list_transactions(&self, include_raw: bool) -> Result<Vec<TransactionDetails>, Error> {
+        self.database.borrow().iter_txs(include_raw)
+    }
+
+    pub fn get_balance(&self) -> Result<u64, Error> {
+        Ok(self
+            .list_unspent()?
+            .iter()
+            .fold(0, |sum, i| sum + i.txout.value))
+    }
+
+    pub fn create_tx(
+        &self,
+        addressees: Vec<(Address, u64)>,
+        send_all: bool,
+        fee_perkb: f32,
+        utxos: Option<Vec<OutPoint>>,
+        unspendable: Option<Vec<OutPoint>>,
+    ) -> Result<(PSBT, TransactionDetails), Error> {
+        let mut tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![],
+            output: vec![],
+        };
+
+        let fee_rate = fee_perkb * 100_000.0;
+        if send_all && addressees.len() != 1 {
+            return Err(Error::SendAllMultipleOutputs);
+        }
+
+        // we keep it as a float while we accumulate it, and only round it at the end
+        let mut fee_val: f32 = 0.0;
+        let mut outgoing: u64 = 0;
+        let mut received: u64 = 0;
+
+        let calc_fee_bytes = |wu| (wu as f32) * fee_rate / 4.0;
+        fee_val += calc_fee_bytes(tx.get_weight());
+
+        for (index, (address, satoshi)) in addressees.iter().enumerate() {
+            let value = match send_all {
+                true => 0,
+                false if satoshi.is_dust() => return Err(Error::OutputBelowDustLimit(index)),
+                false => *satoshi,
+            };
+
+            // TODO: check address network
+            if self.is_mine(&address.script_pubkey())? {
+                received += value;
+            }
+
+            let new_out = TxOut {
+                script_pubkey: address.script_pubkey(),
+                value,
+            };
+            fee_val += calc_fee_bytes(serialize(&new_out).len() * 4);
+
+            tx.output.push(new_out);
+
+            outgoing += value;
+        }
+
+        // TODO: assumes same weight to spend external and internal
+        let input_witness_weight = self.descriptor.max_satisfaction_weight();
+
+        let (available_utxos, use_all_utxos) =
+            self.get_available_utxos(&utxos, &unspendable, send_all)?;
+        let (mut inputs, paths, selected_amount, mut fee_val) = self.coin_select(
+            available_utxos,
+            use_all_utxos,
+            fee_rate,
+            outgoing,
+            input_witness_weight,
+            fee_val,
+        )?;
+        tx.input.append(&mut inputs);
+
+        // prepare the change output
+        let change_output = match send_all {
+            true => None,
+            false => {
+                let change_script = self.get_change_address()?;
+                let change_output = TxOut {
+                    script_pubkey: change_script,
+                    value: 0,
+                };
+
+                // take the change into account for fees
+                fee_val += calc_fee_bytes(serialize(&change_output).len() * 4);
+                Some(change_output)
+            }
+        };
+
+        let change_val = selected_amount - outgoing - (fee_val.ceil() as u64);
+        if !send_all && !change_val.is_dust() {
+            let mut change_output = change_output.unwrap();
+            change_output.value = change_val;
+            received += change_val;
+
+            tx.output.push(change_output);
+        } else if send_all && !change_val.is_dust() {
+            // set the outgoing value to whatever we've put in
+            outgoing = selected_amount;
+            // there's only one output, send everything to it
+            tx.output[0].value = change_val;
+
+            // send_all to our address
+            if self.is_mine(&tx.output[0].script_pubkey)? {
+                received = change_val;
+            }
+        } else if send_all {
+            // send_all but the only output would be below dust limit
+            return Err(Error::InsufficientFunds); // TODO: or OutputBelowDustLimit?
+        }
+
+        // TODO: shuffle the outputs
+
+        let txid = tx.txid();
+        let mut psbt = PSBT::from_unsigned_tx(tx)?;
+
+        // add metadata for the inputs
+        for ((psbt_input, (script_type, path)), input) in psbt
+            .inputs
+            .iter_mut()
+            .zip(paths.into_iter())
+            .zip(psbt.global.unsigned_tx.input.iter())
+        {
+            let path: Vec<ChildNumber> = path.into();
+            let index = match path.last() {
+                Some(ChildNumber::Normal { index }) => *index,
+                Some(ChildNumber::Hardened { index }) => *index,
+                None => 0,
+            };
+
+            let desc = match script_type {
+                ScriptType::External => &self.descriptor,
+                ScriptType::Internal => &self.change_descriptor.as_ref().unwrap(),
+            };
+            psbt_input.hd_keypaths = desc.get_hd_keypaths(index).unwrap();
+            let derived_descriptor = desc.derive(index).unwrap();
+
+            // TODO: figure out what do redeem_script and witness_script mean
+            psbt_input.redeem_script = derived_descriptor.psbt_redeem_script();
+            psbt_input.witness_script = derived_descriptor.psbt_witness_script();
+
+            let prev_output = input.previous_output;
+            let prev_tx = self
+                .database
+                .borrow()
+                .get_raw_tx(&prev_output.txid)?
+                .unwrap(); // TODO: remove unwrap
+
+            if derived_descriptor.is_witness() {
+                psbt_input.witness_utxo = Some(prev_tx.output[prev_output.vout as usize].clone());
+            } else {
+                psbt_input.non_witness_utxo = Some(prev_tx);
+            };
+
+            // we always sign with SIGHASH_ALL
+            psbt_input.sighash_type = Some(SigHashType::All);
+        }
+
+        // TODO: add metadata for the outputs, like derivation paths for change addrs
+        /*for psbt_output in psbt.outputs.iter_mut().zip(psbt.global.unsigned_tx.output.iter()) {
+        }*/
+
+        let transaction_details = TransactionDetails {
+            transaction: None,
+            txid: txid,
+            timestamp: Self::get_timestamp(),
+            received,
+            sent: outgoing,
+            height: None,
+        };
+
+        Ok((psbt, transaction_details))
+    }
+
     // Internals
+
+    fn get_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
 
     fn get_path(&self, script: &Script) -> Result<Option<(ScriptType, DerivationPath)>, Error> {
         self.database.borrow().get_path_from_script_pubkey(script)
+    }
+
+    fn get_change_address(&self) -> Result<Script, Error> {
+        let (desc, script_type) = if self.change_descriptor.is_none() {
+            (&self.descriptor, ScriptType::External)
+        } else {
+            (
+                self.change_descriptor.as_ref().unwrap(),
+                ScriptType::Internal,
+            )
+        };
+
+        // TODO: refill the address pool if index is close to the last cached addr
+        let index = self
+            .database
+            .borrow_mut()
+            .increment_last_index(script_type)?;
+
+        Ok(desc.derive(index)?.script_pubkey())
+    }
+
+    fn get_available_utxos(
+        &self,
+        utxo: &Option<Vec<OutPoint>>,
+        unspendable: &Option<Vec<OutPoint>>,
+        send_all: bool,
+    ) -> Result<(Vec<UTXO>, bool), Error> {
+        // TODO: should we consider unconfirmed received rbf txs as "unspendable" too by default?
+        let unspendable_set = match unspendable {
+            None => HashSet::new(),
+            Some(vec) => vec.into_iter().collect(),
+        };
+
+        match utxo {
+            // with manual coin selection we always want to spend all the selected utxos, no matter
+            // what (even if they are marked as unspendable)
+            Some(raw_utxos) => {
+                // TODO: unwrap to remove
+                let full_utxos: Vec<_> = raw_utxos
+                    .iter()
+                    .map(|u| self.database.borrow().get_utxo(&u).unwrap())
+                    .collect();
+                if !full_utxos.iter().all(|u| u.is_some()) {
+                    return Err(Error::UnknownUTXO);
+                }
+
+                Ok((full_utxos.into_iter().map(|x| x.unwrap()).collect(), true))
+            }
+            // otherwise limit ourselves to the spendable utxos and the `send_all` setting
+            None => Ok((
+                self.list_unspent()?
+                    .into_iter()
+                    .filter(|u| !unspendable_set.contains(&u.outpoint))
+                    .collect(),
+                send_all,
+            )),
+        }
+    }
+
+    fn coin_select(
+        &self,
+        mut utxos: Vec<UTXO>,
+        use_all_utxos: bool,
+        fee_rate: f32,
+        outgoing: u64,
+        input_witness_weight: usize,
+        mut fee_val: f32,
+    ) -> Result<(Vec<TxIn>, Vec<(ScriptType, DerivationPath)>, u64, f32), Error> {
+        let mut answer = Vec::new();
+        let mut paths = Vec::new();
+        let calc_fee_bytes = |wu| (wu as f32) * fee_rate / 4.0;
+
+        debug!(
+            "coin select: outgoing = `{}`, fee_val = `{}`, fee_rate = `{}`",
+            outgoing, fee_val, fee_rate
+        );
+
+        // sort so that we pick them starting from the larger. TODO: proper coin selection
+        utxos.sort_by(|a, b| a.txout.value.partial_cmp(&b.txout.value).unwrap());
+
+        let mut selected_amount: u64 = 0;
+        while use_all_utxos || selected_amount < outgoing + (fee_val.ceil() as u64) {
+            let utxo = match utxos.pop() {
+                Some(utxo) => utxo,
+                None if selected_amount < outgoing + (fee_val.ceil() as u64) => {
+                    return Err(Error::InsufficientFunds)
+                }
+                None if use_all_utxos => break,
+                None => return Err(Error::InsufficientFunds),
+            };
+
+            let new_in = TxIn {
+                previous_output: utxo.outpoint,
+                script_sig: Script::default(),
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            };
+            fee_val += calc_fee_bytes(serialize(&new_in).len() * 4 + input_witness_weight);
+            debug!("coin select new fee_val = `{}`", fee_val);
+
+            answer.push(new_in);
+            selected_amount += utxo.txout.value;
+
+            let path = self
+                .database
+                .borrow()
+                .get_path_from_script_pubkey(&utxo.txout.script_pubkey)?
+                .unwrap(); // TODO: remove unrwap
+            paths.push(path);
+        }
+
+        Ok((answer, paths, selected_amount, fee_val))
     }
 }
 
@@ -447,16 +750,5 @@ where
         self.database.borrow_mut().commit_batch(batch)?;
 
         Ok(())
-    }
-
-    pub fn list_unspent(&self) -> Result<Vec<UTXO>, Error> {
-        self.database.borrow().iter_utxos()
-    }
-
-    pub fn get_balance(&self) -> Result<u64, Error> {
-        Ok(self
-            .list_unspent()?
-            .iter()
-            .fold(0, |sum, i| sum + i.txout.value))
     }
 }

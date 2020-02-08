@@ -5,6 +5,10 @@ pub enum Error {
     InvalidU32Bytes(Vec<u8>),
     Generic(String),
     ScriptDoesntHaveAddressForm,
+    SendAllMultipleOutputs,
+    OutputBelowDustLimit(usize),
+    InsufficientFunds,
+    UnknownUTXO,
 
     Descriptor(crate::descriptor::error::Error),
 
@@ -13,6 +17,7 @@ pub enum Error {
     Secp256k1(bitcoin::secp256k1::Error),
     JSON(serde_json::Error),
     Hex(bitcoin::hashes::hex::Error),
+    PSBT(bitcoin::util::psbt::Error),
 
     #[cfg(any(feature = "electrum", feature = "default"))]
     Electrum(electrum_client::Error),
@@ -37,6 +42,7 @@ impl_error!(bitcoin::util::bip32::Error, BIP32);
 impl_error!(bitcoin::secp256k1::Error, Secp256k1);
 impl_error!(serde_json::Error, JSON);
 impl_error!(bitcoin::hashes::hex::Error, Hex);
+impl_error!(bitcoin::util::psbt::Error, PSBT);
 
 #[cfg(any(feature = "electrum", feature = "default"))]
 impl_error!(electrum_client::Error, Electrum);

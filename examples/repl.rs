@@ -1,3 +1,4 @@
+extern crate base64;
 extern crate clap;
 extern crate dirs;
 extern crate env_logger;
@@ -17,7 +18,8 @@ use rustyline::Editor;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, LevelFilter};
 
-use bitcoin::Network;
+use bitcoin::consensus::encode::serialize;
+use bitcoin::{Address, Network, OutPoint};
 use magical_bitcoin_wallet::bitcoin;
 use magical_bitcoin_wallet::sled;
 use magical_bitcoin_wallet::{Client, ExtendedDescriptor, Wallet};
@@ -36,6 +38,36 @@ fn prepare_home_dir() -> PathBuf {
     dir
 }
 
+fn parse_addressee(s: &str) -> Result<(Address, u64), String> {
+    let parts: Vec<_> = s.split(":").collect();
+    if parts.len() != 2 {
+        return Err("Invalid format".to_string());
+    }
+
+    let addr = Address::from_str(&parts[0]);
+    if let Err(e) = addr {
+        return Err(format!("{:?}", e));
+    }
+    let val = u64::from_str(&parts[1]);
+    if let Err(e) = val {
+        return Err(format!("{:?}", e));
+    }
+
+    Ok((addr.unwrap(), val.unwrap()))
+}
+
+fn parse_outpoint(s: &str) -> Result<OutPoint, String> {
+    OutPoint::from_str(s).map_err(|e| format!("{:?}", e))
+}
+
+fn addressee_validator(s: String) -> Result<(), String> {
+    parse_addressee(&s).map(|_| ())
+}
+
+fn outpoint_validator(s: String) -> Result<(), String> {
+    parse_outpoint(&s).map(|_| ())
+}
+
 fn main() {
     env_logger::init();
 
@@ -52,6 +84,55 @@ fn main() {
         )
         .subcommand(
             SubCommand::with_name("get_balance").about("Returns the current wallet balance"),
+        )
+        .subcommand(
+            SubCommand::with_name("create_tx")
+                .about("Creates a new unsigned tranasction")
+                .arg(
+                    Arg::with_name("to")
+                        .long("to")
+                        .value_name("ADDRESS:SAT")
+                        .help("Adds an addressee to the transaction")
+                        .takes_value(true)
+                        .number_of_values(1)
+                        .required(true)
+                        .multiple(true)
+                        .validator(addressee_validator),
+                )
+                .arg(
+                    Arg::with_name("send_all")
+                        .short("all")
+                        .long("send_all")
+                        .help("Sends all the funds (or all the selected utxos). Requires only one addressees of value 0"),
+                )
+                .arg(
+                    Arg::with_name("utxos")
+                        .long("utxos")
+                        .value_name("TXID:VOUT")
+                        .help("Selects which utxos *must* be spent")
+                        .takes_value(true)
+                        .number_of_values(1)
+                        .multiple(true)
+                        .validator(outpoint_validator),
+                )
+                .arg(
+                    Arg::with_name("unspendable")
+                        .long("unspendable")
+                        .value_name("TXID:VOUT")
+                        .help("Marks an utxo as unspendable")
+                        .takes_value(true)
+                        .number_of_values(1)
+                        .multiple(true)
+                        .validator(outpoint_validator),
+                )
+                .arg(
+                    Arg::with_name("fee_rate")
+                        .short("fee")
+                        .long("fee_rate")
+                        .value_name("SATS_VBYTE")
+                        .help("Fee rate to use in sat/vbyte")
+                        .takes_value(true),
+                ),
         );
 
     let mut repl_app = app.clone().setting(AppSettings::NoBinaryName);
@@ -154,6 +235,29 @@ fn main() {
             }
         } else if let Some(_sub_matches) = matches.subcommand_matches("get_balance") {
             println!("{} SAT", wallet.get_balance().unwrap());
+        } else if let Some(sub_matches) = matches.subcommand_matches("create_tx") {
+            let addressees = sub_matches
+                .values_of("to")
+                .unwrap()
+                .map(|s| parse_addressee(s).unwrap())
+                .collect();
+            let send_all = sub_matches.is_present("send_all");
+            let fee_rate = sub_matches
+                .value_of("fee_rate")
+                .map(|s| f32::from_str(s).unwrap())
+                .unwrap_or(1.0);
+            let utxos = sub_matches
+                .values_of("utxos")
+                .map(|s| s.map(|i| parse_outpoint(i).unwrap()).collect());
+            let unspendable = sub_matches
+                .values_of("unspendable")
+                .map(|s| s.map(|i| parse_outpoint(i).unwrap()).collect());
+
+            let result = wallet
+                .create_tx(addressees, send_all, fee_rate * 1e-5, utxos, unspendable)
+                .unwrap();
+            println!("{:#?}", result.1);
+            println!("PSBT: {}", base64::encode(&serialize(&result.0)));
         }
     };
 
