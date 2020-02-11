@@ -1,3 +1,5 @@
+use bitcoin::{OutPoint, Script, Txid};
+
 #[derive(Debug)]
 pub enum Error {
     KeyMismatch(bitcoin::secp256k1::PublicKey, bitcoin::secp256k1::PublicKey),
@@ -9,6 +11,15 @@ pub enum Error {
     OutputBelowDustLimit(usize),
     InsufficientFunds,
     UnknownUTXO,
+    DifferentTransactions,
+
+    // Signing errors (expected, received)
+    InputTxidMismatch((Txid, OutPoint)),
+    InputRedeemScriptMismatch((Script, Script)), // scriptPubKey, redeemScript
+    InputWitnessScriptMismatch((Script, Script)), // scriptPubKey, redeemScript
+    InputUnknownSegwitScript(Script),
+    InputMissingWitnessScript(usize),
+    MissingUTXO,
 
     Descriptor(crate::descriptor::error::Error),
 

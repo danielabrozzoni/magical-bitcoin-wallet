@@ -8,6 +8,9 @@ use bitcoin::{PrivateKey, PublicKey, Script, SigHashType, Transaction};
 
 use bitcoin::secp256k1::{self, All, Message, Secp256k1};
 
+#[allow(unused_imports)]
+use log::{debug, error, info, trace};
+
 use miniscript::{BitcoinSig, Satisfier};
 
 use crate::descriptor::ExtendedDescriptor;
@@ -38,6 +41,8 @@ impl<'a> PSBTSatisfier<'a> {
 impl<'a> Satisfier<bitcoin::PublicKey> for PSBTSatisfier<'a> {
     // from https://docs.rs/miniscript/0.12.0/src/miniscript/psbt/mod.rs.html#96
     fn lookup_sig(&self, pk: &bitcoin::PublicKey) -> Option<BitcoinSig> {
+        debug!("lookup_sig: {}", pk);
+
         if let Some(rawsig) = self.input.partial_sigs.get(pk) {
             let (flag, sig) = rawsig.split_last().unwrap();
             let flag = bitcoin::SigHashType::from_u32(*flag as u32);
@@ -52,11 +57,15 @@ impl<'a> Satisfier<bitcoin::PublicKey> for PSBTSatisfier<'a> {
     }
 
     fn check_older(&self, height: u32) -> bool {
+        debug!("check_older: {}", height);
+
         // TODO: test >= / >
         self.current_height.unwrap_or(0) >= self.create_height.unwrap_or(0) + height
     }
 
     fn check_after(&self, height: u32) -> bool {
+        debug!("check_older: {}", height);
+
         self.current_height.unwrap_or(0) > height
     }
 }
@@ -93,6 +102,17 @@ impl<'a> PSBTSigner<'a> {
             extended_keys,
             private_keys,
         })
+    }
+
+    pub fn extend(&mut self, mut other: PSBTSigner) -> Result<(), Error> {
+        if self.tx.txid() != other.tx.txid() {
+            return Err(Error::DifferentTransactions);
+        }
+
+        self.extended_keys.append(&mut other.extended_keys);
+        self.private_keys.append(&mut other.private_keys);
+
+        Ok(())
     }
 }
 

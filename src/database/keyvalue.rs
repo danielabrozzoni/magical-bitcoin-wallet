@@ -268,7 +268,7 @@ impl Database for Tree {
     }
 
     fn iter_txs(&self, include_raw: bool) -> Result<Vec<TransactionDetails>, Error> {
-        let key = SledKey::RawTx(None).as_sled_key();
+        let key = SledKey::Transaction(None).as_sled_key();
         self.scan_prefix(key)
             .map(|x| -> Result<_, Error> {
                 let (k, v) = x?;

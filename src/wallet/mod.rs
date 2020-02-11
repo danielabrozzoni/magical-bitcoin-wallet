@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::cmp;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use bitcoin::blockdata::opcodes;
+use bitcoin::blockdata::script::Builder;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::util::bip32::{ChildNumber, DerivationPath};
@@ -19,8 +21,10 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{DescriptorMeta, ExtendedDescriptor};
+use crate::descriptor::{DerivedDescriptor, DescriptorMeta, ExtendedDescriptor};
 use crate::error::Error;
+use crate::psbt::{PSBTSatisfier, PSBTSigner};
+use crate::signer::Signer;
 use crate::types::*;
 
 #[cfg(any(feature = "electrum", feature = "default"))]
@@ -37,7 +41,7 @@ pub struct Wallet<S: Read + Write, D: BatchDatabase> {
 
     client: Option<RefCell<Client<S>>>,
     database: RefCell<D>,
-    secp: Secp256k1<All>,
+    _secp: Secp256k1<All>,
 }
 
 // offline actions, always available
@@ -59,7 +63,7 @@ where
 
             client: None,
             database: RefCell::new(database),
-            secp: Secp256k1::gen_new(),
+            _secp: Secp256k1::gen_new(),
         }
     }
 
@@ -218,10 +222,7 @@ where
                 None => 0,
             };
 
-            let desc = match script_type {
-                ScriptType::External => &self.descriptor,
-                ScriptType::Internal => &self.change_descriptor.as_ref().unwrap(),
-            };
+            let desc = self.get_descriptor_for(script_type);
             psbt_input.hd_keypaths = desc.get_hd_keypaths(index).unwrap();
             let derived_descriptor = desc.derive(index).unwrap();
 
@@ -262,6 +263,156 @@ where
         Ok((psbt, transaction_details))
     }
 
+    pub fn sign(&self, mut psbt: PSBT) -> Result<(PSBT, bool), Error> {
+        let mut derived_descriptors = BTreeMap::new();
+
+        let tx = &psbt.global.unsigned_tx;
+
+        // try to add hd_keypaths if we've already seen the output
+        for (n, psbt_input) in psbt.inputs.iter_mut().enumerate() {
+            let out = match (&psbt_input.witness_utxo, &psbt_input.non_witness_utxo) {
+                (Some(wit_out), _) => Some(wit_out),
+                (_, Some(in_tx))
+                    if (tx.input[n].previous_output.vout as usize) < in_tx.output.len() =>
+                {
+                    Some(&in_tx.output[tx.input[n].previous_output.vout as usize])
+                }
+                _ => None,
+            };
+
+            debug!("searching hd_keypaths for out: {:?}", out);
+
+            if let Some(out) = out {
+                let option_path = self
+                    .database
+                    .borrow()
+                    .get_path_from_script_pubkey(&out.script_pubkey)?;
+
+                debug!("found descriptor path {:?}", option_path);
+
+                let (script_type, path) = match option_path {
+                    None => continue,
+                    Some((script_type, path)) => (script_type, path),
+                };
+
+                // TODO: this is duplicated code
+                let index = match path.into_iter().last() {
+                    Some(ChildNumber::Normal { index }) => *index,
+                    Some(ChildNumber::Hardened { index }) => *index,
+                    None => 0,
+                };
+
+                let desc = self.get_descriptor_for(script_type);
+                let derived_descriptor = desc.derive(index)?;
+                derived_descriptors.insert(n, derived_descriptor);
+
+                let mut hd_keypaths = desc.get_hd_keypaths(index)?;
+                /*for (pk, (fing, path)) in hd_keypaths {
+                    //meta.insert(pk,
+                } */
+
+                // merge hd_keypaths
+                psbt_input.hd_keypaths.append(&mut hd_keypaths);
+            }
+        }
+
+        let mut signer = PSBTSigner::from_descriptor(&psbt.global.unsigned_tx, &self.descriptor)?;
+        if let Some(desc) = &self.change_descriptor {
+            let change_signer = PSBTSigner::from_descriptor(&psbt.global.unsigned_tx, desc)?;
+            signer.extend(change_signer)?;
+        }
+
+        // sign everything we can. TODO: we should do this "on demand": build an index and when the
+        // satisfier asks for a signature we make it at that time.
+        for (i, input) in psbt.inputs.iter_mut().enumerate() {
+            let prevout = tx.input[i].previous_output;
+
+            for (pubkey, (fing, path)) in &input.hd_keypaths {
+                let sighash = input.sighash_type.unwrap_or(SigHashType::All);
+
+                let bitcoin_sig = if let Some(non_wit_utxo) = &input.non_witness_utxo {
+                    if non_wit_utxo.txid() != prevout.txid {
+                        return Err(Error::InputTxidMismatch((non_wit_utxo.txid(), prevout)));
+                    }
+
+                    let prev_script = &non_wit_utxo.output
+                        [psbt.global.unsigned_tx.input[i].previous_output.vout as usize]
+                        .script_pubkey;
+
+                    // return (signature, sighash) from here
+                    if let Some(redeem_script) = &input.redeem_script {
+                        if &redeem_script.to_p2sh() != prev_script {
+                            return Err(Error::InputRedeemScriptMismatch((
+                                prev_script.clone(),
+                                redeem_script.clone(),
+                            )));
+                        }
+
+                        signer.sig_legacy_from_fingerprint(i, sighash, fing, path, redeem_script)?
+                    } else {
+                        signer.sig_legacy_from_fingerprint(i, sighash, fing, path, prev_script)?
+                    }
+                } else if let Some(witness_utxo) = &input.witness_utxo {
+                    let value = witness_utxo.value;
+
+                    let script = match &input.redeem_script {
+                        Some(script) if script.to_p2sh() != witness_utxo.script_pubkey => {
+                            return Err(Error::InputRedeemScriptMismatch((
+                                witness_utxo.script_pubkey.clone(),
+                                script.clone(),
+                            )))
+                        }
+                        Some(script) => script,
+                        None => &witness_utxo.script_pubkey,
+                    };
+
+                    if script.is_v0_p2wpkh() {
+                        let script = self.to_p2pkh(&script.as_bytes()[2..]);
+                        signer
+                            .sig_segwit_from_fingerprint(i, sighash, fing, path, &script, value)?
+                    } else if script.is_v0_p2wsh() {
+                        let wit_script = match &input.witness_script {
+                            None => Err(Error::InputMissingWitnessScript(i)),
+                            Some(witness_script) if script != &witness_script.to_v0_p2wsh() => {
+                                Err(Error::InputRedeemScriptMismatch((
+                                    script.clone(),
+                                    witness_script.clone(),
+                                )))
+                            }
+                            Some(witness_script) => Ok(witness_script),
+                        }?;
+
+                        signer.sig_segwit_from_fingerprint(
+                            i,
+                            sighash,
+                            fing,
+                            path,
+                            &wit_script,
+                            value,
+                        )?
+                    } else {
+                        return Err(Error::InputUnknownSegwitScript(script.clone()));
+                    }
+                } else {
+                    return Err(Error::MissingUTXO);
+                };
+
+                if let Some((signature, sighash)) = bitcoin_sig {
+                    let mut concat_sig = Vec::new();
+                    concat_sig.extend_from_slice(&signature.serialize_der());
+                    concat_sig.extend_from_slice(&[sighash as u8]);
+
+                    input.partial_sigs.insert(*pubkey, concat_sig);
+                }
+            }
+        }
+
+        // attempt to finalize
+        let finalized = self.finalize_psbt(tx.clone(), &mut psbt, derived_descriptors);
+
+        Ok((psbt, finalized))
+    }
+
     // Internals
 
     fn get_timestamp() -> u64 {
@@ -273,6 +424,25 @@ where
 
     fn get_path(&self, script: &Script) -> Result<Option<(ScriptType, DerivationPath)>, Error> {
         self.database.borrow().get_path_from_script_pubkey(script)
+    }
+
+    fn get_descriptor_for(&self, script_type: ScriptType) -> &ExtendedDescriptor {
+        let desc = match script_type {
+            ScriptType::External => &self.descriptor,
+            ScriptType::Internal => &self.change_descriptor.as_ref().unwrap_or(&self.descriptor),
+        };
+
+        desc
+    }
+
+    fn to_p2pkh(&self, pubkey_hash: &[u8]) -> Script {
+        Builder::new()
+            .push_opcode(opcodes::all::OP_DUP)
+            .push_opcode(opcodes::all::OP_HASH160)
+            .push_slice(pubkey_hash)
+            .push_opcode(opcodes::all::OP_EQUALVERIFY)
+            .push_opcode(opcodes::all::OP_CHECKSIG)
+            .into_script()
     }
 
     fn get_change_address(&self) -> Result<Script, Error> {
@@ -367,7 +537,7 @@ where
             let new_in = TxIn {
                 previous_output: utxo.outpoint,
                 script_sig: Script::default(),
-                sequence: 0xFFFFFFFD,
+                sequence: 0xFFFFFFFD, // TODO: change according to rbf/csv
                 witness: vec![],
             };
             fee_val += calc_fee_bytes(serialize(&new_in).len() * 4 + input_witness_weight);
@@ -385,6 +555,41 @@ where
         }
 
         Ok((answer, paths, selected_amount, fee_val))
+    }
+
+    fn finalize_psbt(
+        &self,
+        mut tx: Transaction,
+        psbt: &mut PSBT,
+        derived_descriptors: BTreeMap<usize, DerivedDescriptor>,
+    ) -> bool {
+        for (n, input) in tx.input.iter_mut().enumerate() {
+            debug!("getting descriptor for {}", n);
+
+            let desc = match derived_descriptors.get(&n) {
+                None => return false,
+                Some(desc) => desc,
+            };
+
+            // TODO: use height once we sync headers
+            let satisfier = PSBTSatisfier::new(&psbt.inputs[n], None, None);
+
+            match desc.satisfy(input, satisfier) {
+                Ok(_) => continue,
+                Err(e) => {
+                    debug!("satisfy error {:?} for input {}", e, n);
+                    return false;
+                }
+            }
+        }
+
+        // consume tx to extract its input's script_sig and witnesses and move them into the psbt
+        for (input, psbt_input) in tx.input.into_iter().zip(psbt.inputs.iter_mut()) {
+            psbt_input.final_script_sig = Some(input.script_sig);
+            psbt_input.final_script_witness = Some(input.witness);
+        }
+
+        true
     }
 }
 
@@ -408,7 +613,7 @@ where
 
             client: Some(RefCell::new(client)),
             database: RefCell::new(database),
-            secp: Secp256k1::gen_new(),
+            _secp: Secp256k1::gen_new(),
         }
     }
 
@@ -750,5 +955,16 @@ where
         self.database.borrow_mut().commit_batch(batch)?;
 
         Ok(())
+    }
+
+    pub fn broadcast(&mut self, psbt: PSBT) -> Result<Transaction, Error> {
+        let extracted = psbt.extract_tx();
+        self.client
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .transaction_broadcast(&extracted)?;
+
+        Ok(extracted)
     }
 }

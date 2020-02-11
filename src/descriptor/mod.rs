@@ -261,20 +261,18 @@ impl ExtendedDescriptor {
         Ok(self.internal.translate_pk(translatefpk, translatefpkh)?)
     }
 
-    pub fn get_xprv(&self) -> Vec<ExtendedPrivKey> {
+    pub fn get_xprv(&self) -> impl IntoIterator<Item = ExtendedPrivKey> + '_ {
         self.keys
             .iter()
             .filter(|(_, v)| v.xprv().is_some())
             .map(|(_, v)| v.xprv().unwrap())
-            .collect()
     }
 
-    pub fn get_secret_keys(&self) -> Vec<PrivateKey> {
+    pub fn get_secret_keys(&self) -> impl IntoIterator<Item = PrivateKey> + '_ {
         self.keys
             .iter()
             .filter(|(_, v)| v.as_secret_key().is_some())
             .map(|(_, v)| v.as_secret_key().unwrap())
-            .collect()
     }
 
     pub fn get_hd_keypaths(

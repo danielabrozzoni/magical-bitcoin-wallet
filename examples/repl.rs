@@ -18,8 +18,10 @@ use rustyline::Editor;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, LevelFilter};
 
-use bitcoin::consensus::encode::serialize;
+use bitcoin::consensus::encode::{deserialize, serialize, serialize_hex};
+use bitcoin::util::psbt::PartiallySignedTransaction;
 use bitcoin::{Address, Network, OutPoint};
+
 use magical_bitcoin_wallet::bitcoin;
 use magical_bitcoin_wallet::sled;
 use magical_bitcoin_wallet::{Client, ExtendedDescriptor, Wallet};
@@ -133,7 +135,19 @@ fn main() {
                         .help("Fee rate to use in sat/vbyte")
                         .takes_value(true),
                 ),
-        );
+        )
+        .subcommand(
+            SubCommand::with_name("sign")
+                .about("Signs and tries to finalize a PSBT")
+                .arg(
+                    Arg::with_name("psbt")
+                        .long("psbt")
+                        .value_name("BASE64_PSBT")
+                        .help("Sets the PSBT to sign")
+                        .takes_value(true)
+                        .number_of_values(1)
+                        .required(true),
+                ));
 
     let mut repl_app = app.clone().setting(AppSettings::NoBinaryName);
 
@@ -258,6 +272,17 @@ fn main() {
                 .unwrap();
             println!("{:#?}", result.1);
             println!("PSBT: {}", base64::encode(&serialize(&result.0)));
+        } else if let Some(sub_matches) = matches.subcommand_matches("sign") {
+            let psbt = base64::decode(sub_matches.value_of("psbt").unwrap()).unwrap();
+            let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
+            let (psbt, finalized) = wallet.sign(psbt).unwrap();
+
+            println!("Finalized: {}", finalized);
+            if finalized {
+                println!("Extracted: {}", serialize_hex(&psbt.extract_tx()));
+            } else {
+                println!("PSBT: {}", base64::encode(&serialize(&psbt)));
+            }
         }
     };
 
