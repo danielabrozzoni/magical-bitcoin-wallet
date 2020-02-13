@@ -16,9 +16,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod error;
 pub mod extended_key;
+pub mod policy;
 
 pub use self::error::Error;
 pub use self::extended_key::{DerivationIndex, DescriptorExtendedKey};
+pub use self::policy::{ExtractPolicy, Policy};
 
 #[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Default)]
 struct DummyKey();

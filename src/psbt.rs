@@ -57,6 +57,7 @@ impl<'a> Satisfier<bitcoin::PublicKey> for PSBTSatisfier<'a> {
     }
 
     fn check_older(&self, height: u32) -> bool {
+        // TODO: also check if `nSequence` right
         debug!("check_older: {}", height);
 
         // TODO: test >= / >
@@ -64,6 +65,7 @@ impl<'a> Satisfier<bitcoin::PublicKey> for PSBTSatisfier<'a> {
     }
 
     fn check_after(&self, height: u32) -> bool {
+        // TODO: also check if `nLockTime` is right
         debug!("check_older: {}", height);
 
         self.current_height.unwrap_or(0) > height

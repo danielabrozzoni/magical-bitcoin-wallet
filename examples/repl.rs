@@ -134,6 +134,14 @@ fn main() {
                         .value_name("SATS_VBYTE")
                         .help("Fee rate to use in sat/vbyte")
                         .takes_value(true),
+                )
+                .arg(
+                    Arg::with_name("policy")
+                        .long("policy")
+                        .value_name("POLICY")
+                        .help("Selects which policy will be used to satisfy the descriptor")
+                        .takes_value(true)
+                        .number_of_values(1),
                 ),
         )
         .subcommand(
@@ -266,9 +274,19 @@ fn main() {
             let unspendable = sub_matches
                 .values_of("unspendable")
                 .map(|s| s.map(|i| parse_outpoint(i).unwrap()).collect());
+            let policy: Option<Vec<_>> = sub_matches
+                .value_of("policy")
+                .map(|s| serde_json::from_str::<Vec<Vec<usize>>>(&s).unwrap());
 
             let result = wallet
-                .create_tx(addressees, send_all, fee_rate * 1e-5, utxos, unspendable)
+                .create_tx(
+                    addressees,
+                    send_all,
+                    fee_rate * 1e-5,
+                    policy,
+                    utxos,
+                    unspendable,
+                )
                 .unwrap();
             println!("{:#?}", result.1);
             println!("PSBT: {}", base64::encode(&serialize(&result.0)));

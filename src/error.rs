@@ -13,6 +13,9 @@ pub enum Error {
     UnknownUTXO,
     DifferentTransactions,
 
+    SpendingPolicyRequired,
+    InvalidPolicyPathError(crate::descriptor::policy::PolicyError),
+
     // Signing errors (expected, received)
     InputTxidMismatch((Txid, OutPoint)),
     InputRedeemScriptMismatch((Script, Script)), // scriptPubKey, redeemScript
@@ -47,6 +50,10 @@ macro_rules! impl_error {
 }
 
 impl_error!(crate::descriptor::error::Error, Descriptor);
+impl_error!(
+    crate::descriptor::policy::PolicyError,
+    InvalidPolicyPathError
+);
 
 impl_error!(bitcoin::consensus::encode::Error, Encode);
 impl_error!(bitcoin::util::bip32::Error, BIP32);

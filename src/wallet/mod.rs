@@ -21,7 +21,7 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{DerivedDescriptor, DescriptorMeta, ExtendedDescriptor};
+use crate::descriptor::{DerivedDescriptor, DescriptorMeta, ExtendedDescriptor, ExtractPolicy};
 use crate::error::Error;
 use crate::psbt::{PSBTSatisfier, PSBTSigner};
 use crate::signer::Signer;
@@ -40,7 +40,7 @@ pub struct Wallet<S: Read + Write, D: BatchDatabase> {
     network: Network,
 
     client: Option<RefCell<Client<S>>>,
-    database: RefCell<D>,
+    database: RefCell<D>, // TODO: save descriptor checksum and check when loading
     _secp: Secp256k1<All>,
 }
 
@@ -104,12 +104,24 @@ where
         addressees: Vec<(Address, u64)>,
         send_all: bool,
         fee_perkb: f32,
+        policy_path: Option<Vec<Vec<usize>>>,
         utxos: Option<Vec<OutPoint>>,
         unspendable: Option<Vec<OutPoint>>,
     ) -> Result<(PSBT, TransactionDetails), Error> {
+        // TODO: change descriptor too
+        // TODO: run on pre-derived descriptor
+        let policy = self.descriptor.derive(0).unwrap().extract_policy().unwrap();
+        if policy.requires_path() && policy_path.is_none() {
+            return Err(Error::SpendingPolicyRequired);
+        }
+        let requirements = policy_path.map_or(Ok(Default::default()), |path| {
+            policy.get_requirements(&path, 0)
+        })?;
+        debug!("requirements: {:?}", requirements);
+
         let mut tx = Transaction {
             version: 2,
-            lock_time: 0,
+            lock_time: requirements.timelock.unwrap_or(0),
             input: vec![],
             output: vec![],
         };
@@ -163,6 +175,9 @@ where
             input_witness_weight,
             fee_val,
         )?;
+        inputs
+            .iter_mut()
+            .for_each(|i| i.sequence = requirements.csv.unwrap_or(0xFFFFFFFF));
         tx.input.append(&mut inputs);
 
         // prepare the change output
