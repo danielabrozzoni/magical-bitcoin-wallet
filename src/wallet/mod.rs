@@ -11,7 +11,11 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::util::bip32::{ChildNumber, DerivationPath};
 use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
-use bitcoin::{Address, Network, OutPoint, Script, SigHashType, Transaction, TxIn, TxOut, Txid};
+use bitcoin::{
+    Address, Network, OutPoint, PublicKey, Script, SigHashType, Transaction, TxIn, TxOut, Txid,
+};
+
+use miniscript::BitcoinSig;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -21,7 +25,9 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{DerivedDescriptor, DescriptorMeta, ExtendedDescriptor, ExtractPolicy};
+use crate::descriptor::{
+    DerivedDescriptor, DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy,
+};
 use crate::error::Error;
 use crate::psbt::{PSBTSatisfier, PSBTSigner};
 use crate::signer::Signer;
@@ -340,12 +346,22 @@ where
         // sign everything we can. TODO: we should do this "on demand": build an index and when the
         // satisfier asks for a signature we make it at that time.
         for (i, input) in psbt.inputs.iter_mut().enumerate() {
+            let sighash = input.sighash_type.unwrap_or(SigHashType::All);
             let prevout = tx.input[i].previous_output;
 
-            for (pubkey, (fing, path)) in &input.hd_keypaths {
-                let sighash = input.sighash_type.unwrap_or(SigHashType::All);
+            let mut partial_sigs = BTreeMap::new();
+            {
+                let mut push_sig = |pubkey: &PublicKey, opt_sig: Option<BitcoinSig>| {
+                    if let Some((signature, sighash)) = opt_sig {
+                        let mut concat_sig = Vec::new();
+                        concat_sig.extend_from_slice(&signature.serialize_der());
+                        concat_sig.extend_from_slice(&[sighash as u8]);
+                        //input.partial_sigs.insert(*pubkey, concat_sig);
+                        partial_sigs.insert(*pubkey, concat_sig);
+                    }
+                };
 
-                let bitcoin_sig = if let Some(non_wit_utxo) = &input.non_witness_utxo {
+                if let Some(non_wit_utxo) = &input.non_witness_utxo {
                     if non_wit_utxo.txid() != prevout.txid {
                         return Err(Error::InputTxidMismatch((non_wit_utxo.txid(), prevout)));
                     }
@@ -355,7 +371,7 @@ where
                         .script_pubkey;
 
                     // return (signature, sighash) from here
-                    if let Some(redeem_script) = &input.redeem_script {
+                    let sign_script = if let Some(redeem_script) = &input.redeem_script {
                         if &redeem_script.to_p2sh() != prev_script {
                             return Err(Error::InputRedeemScriptMismatch((
                                 prev_script.clone(),
@@ -363,9 +379,29 @@ where
                             )));
                         }
 
-                        signer.sig_legacy_from_fingerprint(i, sighash, fing, path, redeem_script)?
+                        redeem_script
                     } else {
-                        signer.sig_legacy_from_fingerprint(i, sighash, fing, path, prev_script)?
+                        prev_script
+                    };
+
+                    for (pubkey, (fing, path)) in &input.hd_keypaths {
+                        push_sig(
+                            pubkey,
+                            signer.sig_legacy_from_fingerprint(
+                                i,
+                                sighash,
+                                fing,
+                                path,
+                                sign_script,
+                            )?,
+                        );
+                    }
+                    // TODO: this sucks, we sign with every key
+                    for pubkey in signer.all_public_keys() {
+                        push_sig(
+                            pubkey,
+                            signer.sig_legacy_from_pubkey(i, sighash, pubkey, sign_script)?,
+                        );
                     }
                 } else if let Some(witness_utxo) = &input.witness_utxo {
                     let value = witness_utxo.value;
@@ -381,12 +417,10 @@ where
                         None => &witness_utxo.script_pubkey,
                     };
 
-                    if script.is_v0_p2wpkh() {
-                        let script = self.to_p2pkh(&script.as_bytes()[2..]);
-                        signer
-                            .sig_segwit_from_fingerprint(i, sighash, fing, path, &script, value)?
+                    let sign_script = if script.is_v0_p2wpkh() {
+                        self.to_p2pkh(&script.as_bytes()[2..])
                     } else if script.is_v0_p2wsh() {
-                        let wit_script = match &input.witness_script {
+                        match &input.witness_script {
                             None => Err(Error::InputMissingWitnessScript(i)),
                             Some(witness_script) if script != &witness_script.to_v0_p2wsh() => {
                                 Err(Error::InputRedeemScriptMismatch((
@@ -395,37 +429,60 @@ where
                                 )))
                             }
                             Some(witness_script) => Ok(witness_script),
-                        }?;
-
-                        signer.sig_segwit_from_fingerprint(
-                            i,
-                            sighash,
-                            fing,
-                            path,
-                            &wit_script,
-                            value,
-                        )?
+                        }?
+                        .clone()
                     } else {
                         return Err(Error::InputUnknownSegwitScript(script.clone()));
+                    };
+
+                    for (pubkey, (fing, path)) in &input.hd_keypaths {
+                        push_sig(
+                            pubkey,
+                            signer.sig_segwit_from_fingerprint(
+                                i,
+                                sighash,
+                                fing,
+                                path,
+                                &sign_script,
+                                value,
+                            )?,
+                        );
+                    }
+                    // TODO: this sucks, we sign with every key
+                    for pubkey in signer.all_public_keys() {
+                        push_sig(
+                            pubkey,
+                            signer.sig_segwit_from_pubkey(
+                                i,
+                                sighash,
+                                pubkey,
+                                &sign_script,
+                                value,
+                            )?,
+                        );
                     }
                 } else {
                     return Err(Error::MissingUTXO);
-                };
-
-                if let Some((signature, sighash)) = bitcoin_sig {
-                    let mut concat_sig = Vec::new();
-                    concat_sig.extend_from_slice(&signature.serialize_der());
-                    concat_sig.extend_from_slice(&[sighash as u8]);
-
-                    input.partial_sigs.insert(*pubkey, concat_sig);
                 }
             }
+
+            // push all the signatures into the psbt
+            input.partial_sigs.append(&mut partial_sigs);
         }
 
         // attempt to finalize
         let finalized = self.finalize_psbt(tx.clone(), &mut psbt, derived_descriptors);
 
         Ok((psbt, finalized))
+    }
+
+    pub fn policies(&self, script_type: ScriptType) -> Result<Option<Policy>, Error> {
+        match (script_type, self.change_descriptor.as_ref()) {
+            // TODO: on the un-derived descriptor
+            (ScriptType::External, _) => Ok(self.descriptor.derive(0)?.extract_policy()),
+            (ScriptType::Internal, None) => Ok(None),
+            (ScriptType::Internal, Some(desc)) => Ok(desc.derive(0)?.extract_policy()),
+        }
     }
 
     // Internals

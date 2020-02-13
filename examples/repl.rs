@@ -24,6 +24,7 @@ use bitcoin::{Address, Network, OutPoint};
 
 use magical_bitcoin_wallet::bitcoin;
 use magical_bitcoin_wallet::sled;
+use magical_bitcoin_wallet::types::ScriptType;
 use magical_bitcoin_wallet::{Client, ExtendedDescriptor, Wallet};
 
 fn prepare_home_dir() -> PathBuf {
@@ -144,6 +145,10 @@ fn main() {
                         .number_of_values(1),
                 ),
         )
+        .subcommand(
+            SubCommand::with_name("policies")
+                .about("Returns the available spending policies for the descriptor")
+            )
         .subcommand(
             SubCommand::with_name("sign")
                 .about("Signs and tries to finalize a PSBT")
@@ -290,6 +295,15 @@ fn main() {
                 .unwrap();
             println!("{:#?}", result.1);
             println!("PSBT: {}", base64::encode(&serialize(&result.0)));
+        } else if let Some(_sub_matches) = matches.subcommand_matches("policies") {
+            println!(
+                "External: {}",
+                serde_json::to_string(&wallet.policies(ScriptType::External).unwrap()).unwrap()
+            );
+            println!(
+                "Internal: {}",
+                serde_json::to_string(&wallet.policies(ScriptType::Internal).unwrap()).unwrap()
+            );
         } else if let Some(sub_matches) = matches.subcommand_matches("sign") {
             let psbt = base64::decode(sub_matches.value_of("psbt").unwrap()).unwrap();
             let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
