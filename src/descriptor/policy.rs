@@ -80,7 +80,11 @@ pub struct PathRequirements {
 }
 
 impl PathRequirements {
-    pub fn merge(&mut self, other: Self) -> Result<(), PolicyError> {
+    pub fn merge(&mut self, other: &Self) -> Result<(), PolicyError> {
+        if other.is_null() {
+            return Ok(());
+        }
+
         match (self.csv, other.csv) {
             (Some(old), Some(new)) if old != new => Err(PolicyError::DifferentCSV(old, new)),
             _ => {
@@ -99,12 +103,17 @@ impl PathRequirements {
 
         Ok(())
     }
+
+    pub fn is_null(&self) -> bool {
+        self.csv.is_none() && self.timelock.is_none()
+    }
 }
 
 #[derive(Debug)]
 pub enum PolicyError {
-    NotEnoughItemsSelected,
-    TooManyItemsSelected,
+    NotEnoughItemsSelected(usize),
+    TooManyItemsSelected(usize),
+    IndexOutOfRange(usize, usize),
     DifferentCSV(u32, u32),
     DifferentTimelock(u32, u32),
 }
@@ -161,34 +170,67 @@ impl Policy {
     }
 
     pub fn requires_path(&self) -> bool {
-        !self.item.is_leaf()
+        self.get_requirements(&vec![]).is_err()
     }
 
     pub fn get_requirements(
         &self,
         path: &Vec<Vec<usize>>,
+    ) -> Result<PathRequirements, PolicyError> {
+        self.recursive_get_requirements(path, 0)
+    }
+
+    fn recursive_get_requirements(
+        &self,
+        path: &Vec<Vec<usize>>,
         index: usize,
     ) -> Result<PathRequirements, PolicyError> {
-        // TODO: check that indexes are in rage
+        // if items.len() == threshold, selected can be omitted and we take all of them by default
+        let default = match &self.item {
+            SatisfiableItem::Thresh { items, threshold } if items.len() == *threshold => {
+                (0..*threshold).into_iter().collect()
+            }
+            _ => vec![],
+        };
+        let selected = match path.get(index) {
+            _ if !default.is_empty() => &default,
+            Some(arr) => arr,
+            _ => &default,
+        };
 
-        let selected = &path[index];
         match &self.item {
-            SatisfiableItem::Thresh {
-                items: _,
-                threshold,
-            } if selected.len() < *threshold => Err(PolicyError::NotEnoughItemsSelected),
-            SatisfiableItem::Thresh {
-                items,
-                threshold: _,
-            } => {
+            SatisfiableItem::Thresh { items, threshold } => {
+                let mapped_req = items
+                    .iter()
+                    .map(|i| i.recursive_get_requirements(path, index + 1))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // if all the requirements are null we don't care about `selected` because there
+                // are no requirements
+                if mapped_req.iter().all(PathRequirements::is_null) {
+                    return Ok(PathRequirements::default());
+                }
+
+                // if we have something, make sure we have enough items. note that the user can set
+                // an empty value for this step in case of n-of-n, because `selected` is set to all
+                // the elements above
+                if selected.len() < *threshold {
+                    return Err(PolicyError::NotEnoughItemsSelected(index));
+                }
+
+                // check the selected items, see if there are conflicting requirements
                 let mut requirements = PathRequirements::default();
                 for item_index in selected {
-                    requirements.merge(items[*item_index].get_requirements(path, index + 1)?)?;
+                    requirements.merge(
+                        mapped_req
+                            .get(*item_index)
+                            .ok_or(PolicyError::IndexOutOfRange(*item_index, index))?,
+                    )?;
                 }
 
                 Ok(requirements)
             }
-            _ if selected.len() > 0 => Err(PolicyError::TooManyItemsSelected),
+            _ if !selected.is_empty() => Err(PolicyError::TooManyItemsSelected(index)),
             SatisfiableItem::AbsoluteTimelock { height } => Ok(PathRequirements {
                 csv: None,
                 timelock: Some(*height),

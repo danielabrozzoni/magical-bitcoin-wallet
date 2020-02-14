@@ -40,6 +40,7 @@ use electrum_client::Client;
 #[cfg(not(any(feature = "electrum", feature = "default")))]
 use std::marker::PhantomData as Client;
 
+// TODO: force descriptor and change_descriptor to have the same policies?
 pub struct Wallet<S: Read + Write, D: BatchDatabase> {
     descriptor: ExtendedDescriptor,
     change_descriptor: Option<ExtendedDescriptor>,
@@ -105,6 +106,7 @@ where
             .fold(0, |sum, i| sum + i.txout.value))
     }
 
+    // TODO: add a flag to ignore change in coin selection
     pub fn create_tx(
         &self,
         addressees: Vec<(Address, u64)>,
@@ -114,14 +116,13 @@ where
         utxos: Option<Vec<OutPoint>>,
         unspendable: Option<Vec<OutPoint>>,
     ) -> Result<(PSBT, TransactionDetails), Error> {
-        // TODO: change descriptor too
-        // TODO: run on pre-derived descriptor
+        // TODO: run before deriving the descriptor
         let policy = self.descriptor.derive(0).unwrap().extract_policy().unwrap();
         if policy.requires_path() && policy_path.is_none() {
             return Err(Error::SpendingPolicyRequired);
         }
         let requirements = policy_path.map_or(Ok(Default::default()), |path| {
-            policy.get_requirements(&path, 0)
+            policy.get_requirements(&path)
         })?;
         debug!("requirements: {:?}", requirements);
 
@@ -284,6 +285,7 @@ where
         Ok((psbt, transaction_details))
     }
 
+    // TODO: define an enum for signing errors
     pub fn sign(&self, mut psbt: PSBT) -> Result<(PSBT, bool), Error> {
         let mut derived_descriptors = BTreeMap::new();
 
@@ -327,12 +329,8 @@ where
                 let derived_descriptor = desc.derive(index)?;
                 derived_descriptors.insert(n, derived_descriptor);
 
-                let mut hd_keypaths = desc.get_hd_keypaths(index)?;
-                /*for (pk, (fing, path)) in hd_keypaths {
-                    //meta.insert(pk,
-                } */
-
                 // merge hd_keypaths
+                let mut hd_keypaths = desc.get_hd_keypaths(index)?;
                 psbt_input.hd_keypaths.append(&mut hd_keypaths);
             }
         }
@@ -343,8 +341,8 @@ where
             signer.extend(change_signer)?;
         }
 
-        // sign everything we can. TODO: we should do this "on demand": build an index and when the
-        // satisfier asks for a signature we make it at that time.
+        // sign everything we can. TODO: ideally we should only sign with the keys in the policy
+        // path selected, if present
         for (i, input) in psbt.inputs.iter_mut().enumerate() {
             let sighash = input.sighash_type.unwrap_or(SigHashType::All);
             let prevout = tx.input[i].previous_output;

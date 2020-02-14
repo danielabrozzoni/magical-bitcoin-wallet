@@ -88,6 +88,7 @@ where
     fn psbt_witness_script(&self) -> Option<Script> {
         match self {
             Descriptor::Wsh(ref script) => Some(script.encode()),
+            Descriptor::ShWsh(ref script) => Some(script.encode()),
             _ => None,
         }
     }

@@ -90,7 +90,7 @@ fn main() {
         )
         .subcommand(
             SubCommand::with_name("create_tx")
-                .about("Creates a new unsigned tranasction")
+                .about("Creates a new unsigned tranasaction")
                 .arg(
                     Arg::with_name("to")
                         .long("to")
@@ -216,7 +216,7 @@ fn main() {
                 .multiple(true)
                 .help("Sets the level of verbosity"),
         )
-        .subcommand(SubCommand::with_name("repl").about("opens an interactive shell"));
+        .subcommand(SubCommand::with_name("repl").about("Opens an interactive shell"));
 
     let matches = app.get_matches();
 
