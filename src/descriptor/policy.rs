@@ -1,20 +1,52 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use bitcoin::hashes::*;
+use bitcoin::secp256k1::Secp256k1;
 use bitcoin::util::bip32::Fingerprint;
 use bitcoin::PublicKey;
 
 use miniscript::{Descriptor, Miniscript, Terminal};
 
+use descriptor::{Key, MiniscriptExtractPolicy};
+
 #[derive(Debug, Serialize)]
-#[serde(tag = "type")]
+pub struct PKOrF {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pubkey: Option<PublicKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<Fingerprint>,
+}
+
+impl PKOrF {
+    fn from_key(k: &Box<dyn Key>) -> Self {
+        let secp = Secp256k1::gen_new();
+
+        if let Some(fing) = k.fingerprint(&secp) {
+            PKOrF {
+                fingerprint: Some(fing),
+                pubkey: None,
+            }
+        } else {
+            PKOrF {
+                fingerprint: None,
+                pubkey: Some(k.as_public_key(&secp, None).unwrap()),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "UPPERCASE")]
 pub enum SatisfiableItem {
     // Leaves
-    Signature {
-        pubkey: PublicKey,
-    },
+    Signature(PKOrF),
     SignatureKey {
-        pubkey_hash: hash160::Hash,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<Fingerprint>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pubkey_hash: Option<hash160::Hash>,
     },
     SHA256Preimage {
         hash: sha256::Hash,
@@ -41,7 +73,7 @@ pub enum SatisfiableItem {
         threshold: usize,
     },
     Multisig {
-        pubkeys: Vec<PublicKey>,
+        keys: Vec<PKOrF>,
         threshold: usize,
     },
 }
@@ -165,8 +197,12 @@ impl Policy {
         Some(SatisfiableItem::Thresh { items, threshold }.into())
     }
 
-    pub fn make_multisig(pubkeys: Vec<PublicKey>, threshold: usize) -> Option<Policy> {
-        Some(SatisfiableItem::Multisig { pubkeys, threshold }.into())
+    fn make_multisig(pubkeys: Vec<Option<&Box<dyn Key>>>, threshold: usize) -> Option<Policy> {
+        let keys = pubkeys
+            .into_iter()
+            .map(|k| PKOrF::from_key(k.unwrap()))
+            .collect();
+        Some(SatisfiableItem::Multisig { keys, threshold }.into())
     }
 
     pub fn requires_path(&self) -> bool {
@@ -254,18 +290,38 @@ pub trait ExtractPolicy {
     fn extract_policy(&self) -> Option<Policy>;
 }
 
-impl ExtractPolicy for Miniscript<PublicKey> {
-    fn extract_policy(&self) -> Option<Policy> {
+fn signature_from_string(key: Option<&Box<dyn Key>>) -> Option<Policy> {
+    key.map(|k| SatisfiableItem::Signature(PKOrF::from_key(k)).into())
+}
+
+fn signature_key_from_string(key: Option<&Box<dyn Key>>) -> Option<Policy> {
+    let secp = Secp256k1::gen_new();
+
+    key.map(|k| {
+        if let Some(fing) = k.fingerprint(&secp) {
+            SatisfiableItem::SignatureKey {
+                fingerprint: Some(fing),
+                pubkey_hash: None,
+            }
+        } else {
+            SatisfiableItem::SignatureKey {
+                fingerprint: None,
+                pubkey_hash: Some(hash160::Hash::hash(
+                    &k.as_public_key(&secp, None).unwrap().to_bytes(),
+                )),
+            }
+        }
+        .into()
+    })
+}
+
+impl MiniscriptExtractPolicy for Miniscript<String> {
+    fn extract_policy(&self, lookup_map: &BTreeMap<String, Box<dyn Key>>) -> Option<Policy> {
         match &self.node {
             // Leaves
             Terminal::True | Terminal::False => None,
-            Terminal::Pk(pubkey) => Some(SatisfiableItem::Signature { pubkey: *pubkey }.into()),
-            Terminal::PkH(pubkey_hash) => Some(
-                SatisfiableItem::SignatureKey {
-                    pubkey_hash: *pubkey_hash,
-                }
-                .into(),
-            ),
+            Terminal::Pk(pubkey) => signature_from_string(lookup_map.get(pubkey)),
+            Terminal::PkH(pubkey_hash) => signature_key_from_string(lookup_map.get(pubkey_hash)),
             Terminal::After(height) => {
                 Some(SatisfiableItem::AbsoluteTimelock { height: *height }.into())
             }
@@ -289,22 +345,27 @@ impl ExtractPolicy for Miniscript<PublicKey> {
             | Terminal::DupIf(inner)
             | Terminal::Verify(inner)
             | Terminal::NonZero(inner)
-            | Terminal::ZeroNotEqual(inner) => inner.extract_policy(),
+            | Terminal::ZeroNotEqual(inner) => inner.extract_policy(lookup_map),
             // Complex policies
             Terminal::AndV(a, b) | Terminal::AndB(a, b) => {
-                Policy::make_and(a.extract_policy(), b.extract_policy())
+                Policy::make_and(a.extract_policy(lookup_map), b.extract_policy(lookup_map))
             }
             Terminal::AndOr(x, y, z) => Policy::make_or(
-                Policy::make_and(x.extract_policy(), y.extract_policy()),
-                z.extract_policy(),
+                Policy::make_and(x.extract_policy(lookup_map), y.extract_policy(lookup_map)),
+                z.extract_policy(lookup_map),
             ),
             Terminal::OrB(a, b)
             | Terminal::OrD(a, b)
             | Terminal::OrC(a, b)
-            | Terminal::OrI(a, b) => Policy::make_or(a.extract_policy(), b.extract_policy()),
+            | Terminal::OrI(a, b) => {
+                Policy::make_or(a.extract_policy(lookup_map), b.extract_policy(lookup_map))
+            }
             Terminal::Thresh(k, nodes) => {
                 let mut threshold = *k;
-                let mapped: Vec<_> = nodes.iter().filter_map(|n| n.extract_policy()).collect();
+                let mapped: Vec<_> = nodes
+                    .iter()
+                    .filter_map(|n| n.extract_policy(lookup_map))
+                    .collect();
 
                 if mapped.len() < nodes.len() {
                     threshold = match threshold.checked_sub(nodes.len() - mapped.len()) {
@@ -315,24 +376,24 @@ impl ExtractPolicy for Miniscript<PublicKey> {
 
                 Policy::make_thresh(mapped, threshold)
             }
-            Terminal::ThreshM(k, pks) => Policy::make_multisig(pks.clone(), *k),
+            Terminal::ThreshM(k, pks) => {
+                Policy::make_multisig(pks.iter().map(|s| lookup_map.get(s)).collect(), *k)
+            }
         }
     }
 }
 
-impl ExtractPolicy for Descriptor<PublicKey> {
-    fn extract_policy(&self) -> Option<Policy> {
+impl MiniscriptExtractPolicy for Descriptor<String> {
+    fn extract_policy(&self, lookup_map: &BTreeMap<String, Box<dyn Key>>) -> Option<Policy> {
         match self {
             Descriptor::Pk(pubkey)
             | Descriptor::Pkh(pubkey)
             | Descriptor::Wpkh(pubkey)
-            | Descriptor::ShWpkh(pubkey) => {
-                Some(SatisfiableItem::Signature { pubkey: *pubkey }.into())
-            }
+            | Descriptor::ShWpkh(pubkey) => signature_from_string(lookup_map.get(pubkey)),
             Descriptor::Bare(inner)
             | Descriptor::Sh(inner)
             | Descriptor::Wsh(inner)
-            | Descriptor::ShWsh(inner) => inner.extract_policy(),
+            | Descriptor::ShWsh(inner) => inner.extract_policy(lookup_map),
         }
     }
 }

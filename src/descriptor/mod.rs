@@ -22,6 +22,10 @@ pub use self::error::Error;
 pub use self::extended_key::{DerivationIndex, DescriptorExtendedKey};
 pub use self::policy::{ExtractPolicy, Policy};
 
+trait MiniscriptExtractPolicy {
+    fn extract_policy(&self, lookup_map: &BTreeMap<String, Box<dyn Key>>) -> Option<Policy>;
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Default)]
 struct DummyKey();
 
@@ -315,6 +319,12 @@ impl ExtendedDescriptor {
 
     pub fn is_fixed(&self) -> bool {
         self.keys.iter().all(|(_, key)| key.is_fixed())
+    }
+}
+
+impl ExtractPolicy for ExtendedDescriptor {
+    fn extract_policy(&self) -> Option<Policy> {
+        self.internal.extract_policy(&self.keys)
     }
 }
 

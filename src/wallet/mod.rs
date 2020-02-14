@@ -117,7 +117,7 @@ where
         unspendable: Option<Vec<OutPoint>>,
     ) -> Result<(PSBT, TransactionDetails), Error> {
         // TODO: run before deriving the descriptor
-        let policy = self.descriptor.derive(0).unwrap().extract_policy().unwrap();
+        let policy = self.descriptor.extract_policy().unwrap();
         if policy.requires_path() && policy_path.is_none() {
             return Err(Error::SpendingPolicyRequired);
         }
@@ -476,10 +476,9 @@ where
 
     pub fn policies(&self, script_type: ScriptType) -> Result<Option<Policy>, Error> {
         match (script_type, self.change_descriptor.as_ref()) {
-            // TODO: on the un-derived descriptor
-            (ScriptType::External, _) => Ok(self.descriptor.derive(0)?.extract_policy()),
+            (ScriptType::External, _) => Ok(self.descriptor.extract_policy()),
             (ScriptType::Internal, None) => Ok(None),
-            (ScriptType::Internal, Some(desc)) => Ok(desc.derive(0)?.extract_policy()),
+            (ScriptType::Internal, Some(desc)) => Ok(desc.extract_policy()),
         }
     }
 
