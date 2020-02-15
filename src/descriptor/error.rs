@@ -6,6 +6,10 @@ pub enum Error {
     MalformedInput,
     KeyParsingError(String),
 
+    MissingPublicKey,
+
+    CantDeriveWithMiniscript,
+
     BIP32(bitcoin::util::bip32::Error),
     Base58(bitcoin::util::base58::Error),
     PK(bitcoin::util::key::Error),

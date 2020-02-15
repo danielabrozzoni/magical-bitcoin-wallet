@@ -91,7 +91,7 @@ impl SatisfiableItem {
         }
     }
 
-    fn satisfy(&self, input: &psbt::Input) -> Satisfaction {
+    fn satisfy(&self, _input: &psbt::Input) -> Satisfaction {
         Satisfaction::None
     }
 }

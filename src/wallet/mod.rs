@@ -15,7 +15,7 @@ use bitcoin::{
     Address, Network, OutPoint, PublicKey, Script, SigHashType, Transaction, TxIn, TxOut, Txid,
 };
 
-use miniscript::BitcoinSig;
+use miniscript::{BitcoinSig, Descriptor, Miniscript};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -25,11 +25,9 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{
-    DerivedDescriptor, DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy,
-};
+use crate::descriptor::{self, DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy};
 use crate::error::Error;
-use crate::psbt::{PSBTSatisfier, PSBTSigner};
+use crate::psbt::{utils::PSBTUtils, PSBTSatisfier, PSBTSigner};
 use crate::signer::Signer;
 use crate::types::*;
 
@@ -286,23 +284,14 @@ where
 
     // TODO: define an enum for signing errors
     pub fn sign(&self, mut psbt: PSBT) -> Result<(PSBT, bool), Error> {
-        let policy = self.descriptor.extract_policy().unwrap();
-        let mut derived_descriptors = BTreeMap::new();
-
         let tx = &psbt.global.unsigned_tx;
+        let mut input_utxos = Vec::with_capacity(psbt.inputs.len());
+        for n in 0..psbt.inputs.len() {
+            input_utxos.push(psbt.get_utxo_for(n).clone());
+        }
 
         // try to add hd_keypaths if we've already seen the output
-        for (n, psbt_input) in psbt.inputs.iter_mut().enumerate() {
-            let out = match (&psbt_input.witness_utxo, &psbt_input.non_witness_utxo) {
-                (Some(wit_out), _) => Some(wit_out),
-                (_, Some(in_tx))
-                    if (tx.input[n].previous_output.vout as usize) < in_tx.output.len() =>
-                {
-                    Some(&in_tx.output[tx.input[n].previous_output.vout as usize])
-                }
-                _ => None,
-            };
-
+        for (psbt_input, out) in psbt.inputs.iter_mut().zip(input_utxos.iter()) {
             debug!("searching hd_keypaths for out: {:?}", out);
 
             if let Some(out) = out {
@@ -325,11 +314,8 @@ where
                     None => 0,
                 };
 
-                let desc = self.get_descriptor_for(script_type);
-                let derived_descriptor = desc.derive(index)?;
-                derived_descriptors.insert(n, derived_descriptor);
-
                 // merge hd_keypaths
+                let desc = self.get_descriptor_for(script_type);
                 let mut hd_keypaths = desc.get_hd_keypaths(index)?;
                 psbt_input.hd_keypaths.append(&mut hd_keypaths);
             }
@@ -469,7 +455,7 @@ where
         }
 
         // attempt to finalize
-        let finalized = self.finalize_psbt(tx.clone(), &mut psbt, derived_descriptors);
+        let finalized = self.finalize_psbt(tx.clone(), &mut psbt);
 
         Ok((psbt, finalized))
     }
@@ -626,18 +612,55 @@ where
         Ok((answer, paths, selected_amount, fee_val))
     }
 
-    fn finalize_psbt(
-        &self,
-        mut tx: Transaction,
-        psbt: &mut PSBT,
-        derived_descriptors: BTreeMap<usize, DerivedDescriptor>,
-    ) -> bool {
+    fn finalize_psbt(&self, mut tx: Transaction, psbt: &mut PSBT) -> bool {
         for (n, input) in tx.input.iter_mut().enumerate() {
-            debug!("getting descriptor for {}", n);
+            let get_pk_from_partial_sigs = || {
+                // here we need the public key.. since it's a single sig, there are only two
+                // options: we can either find it in the `partial_sigs`, or we can't. if we
+                // can't, it means that we can't even satisfy the input, so we can exit knowing
+                // that we did our best to try to find it.
+                psbt.inputs[n]
+                    .partial_sigs
+                    .keys()
+                    .nth(0)
+                    .ok_or(descriptor::Error::MissingPublicKey)
+            };
 
-            let desc = match derived_descriptors.get(&n) {
-                None => return false,
-                Some(desc) => desc,
+            let desc = if let Some(wit_script) = &psbt.inputs[n].witness_script {
+                Miniscript::parse(wit_script)
+                    .map_err(descriptor::Error::Miniscript)
+                    .and_then(|miniscript| self.descriptor.derive_with_miniscript(miniscript))
+            } else if let Some(p2sh_script) = &psbt.inputs[n].redeem_script {
+                if p2sh_script.is_v0_p2wpkh() {
+                    // wrapped p2wpkh
+                    get_pk_from_partial_sigs().map(|pk| Descriptor::ShWpkh(*pk))
+                } else {
+                    Miniscript::parse(p2sh_script)
+                        .map_err(descriptor::Error::Miniscript)
+                        .and_then(|miniscript| self.descriptor.derive_with_miniscript(miniscript))
+                }
+            } else if let Some(utxo) = psbt.get_utxo_for(n) {
+                if utxo.script_pubkey.is_p2pkh() {
+                    get_pk_from_partial_sigs().map(|pk| Descriptor::Pkh(*pk))
+                } else if utxo.script_pubkey.is_p2pk() {
+                    get_pk_from_partial_sigs().map(|pk| Descriptor::Pk(*pk))
+                } else if utxo.script_pubkey.is_v0_p2wpkh() {
+                    get_pk_from_partial_sigs().map(|pk| Descriptor::Wpkh(*pk))
+                } else {
+                    // try as bare script
+                    Miniscript::parse(&utxo.script_pubkey)
+                        .map_err(descriptor::Error::Miniscript)
+                        .and_then(|miniscript| self.descriptor.derive_with_miniscript(miniscript))
+                }
+            } else {
+                return false;
+            };
+
+            debug!("reconstructed descriptor is {:?}", desc);
+
+            let desc = match desc {
+                Err(_) => return false,
+                Ok(desc) => desc,
             };
 
             // TODO: use height once we sync headers

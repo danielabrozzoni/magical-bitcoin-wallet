@@ -4,13 +4,12 @@ use std::convert::{Into, TryFrom};
 use std::fmt;
 use std::str::FromStr;
 
-use bitcoin::blockdata::script::Script;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::util::bip32::{DerivationPath, ExtendedPrivKey, Fingerprint};
-use bitcoin::{PrivateKey, PublicKey};
+use bitcoin::{PrivateKey, PublicKey, Script};
 
-pub use miniscript::descriptor::Descriptor;
+pub use miniscript::{descriptor::Descriptor, Miniscript};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,11 +81,7 @@ where
 
     fn psbt_redeem_script(&self) -> Option<Script> {
         match self {
-            Descriptor::ShWpkh(ref pk) => {
-                let addr =
-                    bitcoin::Address::p2shwpkh(&pk.to_public_key(), bitcoin::Network::Bitcoin);
-                Some(addr.script_pubkey())
-            }
+            Descriptor::ShWpkh(_) => Some(self.witness_script()),
             Descriptor::ShWsh(ref script) => Some(script.encode().to_v0_p2wsh()),
             Descriptor::Sh(ref script) => Some(script.encode()),
             _ => None,
@@ -261,6 +256,20 @@ impl ExtendedDescriptor {
             keys: keys.into_inner(),
             ctx,
         })
+    }
+
+    pub fn derive_with_miniscript(
+        &self,
+        miniscript: Miniscript<PublicKey>,
+    ) -> Result<DerivedDescriptor, Error> {
+        // TODO: make sure they are "equivalent"
+        match self.internal {
+            Descriptor::Bare(_) => Ok(Descriptor::Bare(miniscript)),
+            Descriptor::Sh(_) => Ok(Descriptor::Sh(miniscript)),
+            Descriptor::Wsh(_) => Ok(Descriptor::Wsh(miniscript)),
+            Descriptor::ShWsh(_) => Ok(Descriptor::ShWsh(miniscript)),
+            _ => Err(Error::CantDeriveWithMiniscript),
+        }
     }
 
     pub fn derive(&self, index: u32) -> Result<DerivedDescriptor, Error> {
