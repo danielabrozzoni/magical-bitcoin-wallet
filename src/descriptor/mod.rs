@@ -7,11 +7,14 @@ use std::str::FromStr;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::util::bip32::{DerivationPath, ExtendedPrivKey, Fingerprint};
+use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
 use bitcoin::{PrivateKey, PublicKey, Script};
 
 pub use miniscript::{descriptor::Descriptor, Miniscript};
 
 use serde::{Deserialize, Serialize};
+
+use crate::psbt::utils::PSBTUtils;
 
 pub mod error;
 pub mod extended_key;
@@ -269,6 +272,48 @@ impl ExtendedDescriptor {
             Descriptor::Wsh(_) => Ok(Descriptor::Wsh(miniscript)),
             Descriptor::ShWsh(_) => Ok(Descriptor::ShWsh(miniscript)),
             _ => Err(Error::CantDeriveWithMiniscript),
+        }
+    }
+
+    pub fn derive_from_psbt_input(
+        &self,
+        psbt: &PSBT,
+        input_index: usize,
+    ) -> Result<DerivedDescriptor, Error> {
+        let get_pk_from_partial_sigs = || {
+            // here we need the public key.. since it's a single sig, there are only two
+            // options: we can either find it in the `partial_sigs`, or we can't. if we
+            // can't, it means that we can't even satisfy the input, so we can exit knowing
+            // that we did our best to try to find it.
+            psbt.inputs[input_index]
+                .partial_sigs
+                .keys()
+                .nth(0)
+                .ok_or(Error::MissingPublicKey)
+        };
+
+        if let Some(wit_script) = &psbt.inputs[input_index].witness_script {
+            self.derive_with_miniscript(Miniscript::parse(wit_script)?)
+        } else if let Some(p2sh_script) = &psbt.inputs[input_index].redeem_script {
+            if p2sh_script.is_v0_p2wpkh() {
+                // wrapped p2wpkh
+                get_pk_from_partial_sigs().map(|pk| Descriptor::ShWpkh(*pk))
+            } else {
+                self.derive_with_miniscript(Miniscript::parse(p2sh_script)?)
+            }
+        } else if let Some(utxo) = psbt.get_utxo_for(input_index) {
+            if utxo.script_pubkey.is_p2pkh() {
+                get_pk_from_partial_sigs().map(|pk| Descriptor::Pkh(*pk))
+            } else if utxo.script_pubkey.is_p2pk() {
+                get_pk_from_partial_sigs().map(|pk| Descriptor::Pk(*pk))
+            } else if utxo.script_pubkey.is_v0_p2wpkh() {
+                get_pk_from_partial_sigs().map(|pk| Descriptor::Wpkh(*pk))
+            } else {
+                // try as bare script
+                self.derive_with_miniscript(Miniscript::parse(&utxo.script_pubkey)?)
+            }
+        } else {
+            Err(Error::MissingDetails)
         }
     }
 

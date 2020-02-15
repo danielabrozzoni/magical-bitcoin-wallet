@@ -15,7 +15,7 @@ use bitcoin::{
     Address, Network, OutPoint, PublicKey, Script, SigHashType, Transaction, TxIn, TxOut, Txid,
 };
 
-use miniscript::{BitcoinSig, Descriptor, Miniscript};
+use miniscript::BitcoinSig;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -25,7 +25,7 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{self, DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy};
+use crate::descriptor::{DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy};
 use crate::error::Error;
 use crate::psbt::{utils::PSBTUtils, PSBTSatisfier, PSBTSigner};
 use crate::signer::Signer;
@@ -38,7 +38,7 @@ use electrum_client::Client;
 #[cfg(not(any(feature = "electrum", feature = "default")))]
 use std::marker::PhantomData as Client;
 
-// TODO: force descriptor and change_descriptor to have the same policies?
+// TODO: force descriptor and change_descriptor to have the same policies
 pub struct Wallet<S: Read + Write, D: BatchDatabase> {
     descriptor: ExtendedDescriptor,
     change_descriptor: Option<ExtendedDescriptor>,
@@ -614,48 +614,9 @@ where
 
     fn finalize_psbt(&self, mut tx: Transaction, psbt: &mut PSBT) -> bool {
         for (n, input) in tx.input.iter_mut().enumerate() {
-            let get_pk_from_partial_sigs = || {
-                // here we need the public key.. since it's a single sig, there are only two
-                // options: we can either find it in the `partial_sigs`, or we can't. if we
-                // can't, it means that we can't even satisfy the input, so we can exit knowing
-                // that we did our best to try to find it.
-                psbt.inputs[n]
-                    .partial_sigs
-                    .keys()
-                    .nth(0)
-                    .ok_or(descriptor::Error::MissingPublicKey)
-            };
-
-            let desc = if let Some(wit_script) = &psbt.inputs[n].witness_script {
-                Miniscript::parse(wit_script)
-                    .map_err(descriptor::Error::Miniscript)
-                    .and_then(|miniscript| self.descriptor.derive_with_miniscript(miniscript))
-            } else if let Some(p2sh_script) = &psbt.inputs[n].redeem_script {
-                if p2sh_script.is_v0_p2wpkh() {
-                    // wrapped p2wpkh
-                    get_pk_from_partial_sigs().map(|pk| Descriptor::ShWpkh(*pk))
-                } else {
-                    Miniscript::parse(p2sh_script)
-                        .map_err(descriptor::Error::Miniscript)
-                        .and_then(|miniscript| self.descriptor.derive_with_miniscript(miniscript))
-                }
-            } else if let Some(utxo) = psbt.get_utxo_for(n) {
-                if utxo.script_pubkey.is_p2pkh() {
-                    get_pk_from_partial_sigs().map(|pk| Descriptor::Pkh(*pk))
-                } else if utxo.script_pubkey.is_p2pk() {
-                    get_pk_from_partial_sigs().map(|pk| Descriptor::Pk(*pk))
-                } else if utxo.script_pubkey.is_v0_p2wpkh() {
-                    get_pk_from_partial_sigs().map(|pk| Descriptor::Wpkh(*pk))
-                } else {
-                    // try as bare script
-                    Miniscript::parse(&utxo.script_pubkey)
-                        .map_err(descriptor::Error::Miniscript)
-                        .and_then(|miniscript| self.descriptor.derive_with_miniscript(miniscript))
-                }
-            } else {
-                return false;
-            };
-
+            // safe to run only on the descriptor because we assume the change descriptor also has
+            // the same structure
+            let desc = self.descriptor.derive_from_psbt_input(psbt, n);
             debug!("reconstructed descriptor is {:?}", desc);
 
             let desc = match desc {

@@ -6,7 +6,9 @@ pub enum Error {
     MalformedInput,
     KeyParsingError(String),
 
+    InputIndexDoesntExist,
     MissingPublicKey,
+    MissingDetails,
 
     CantDeriveWithMiniscript,
 
