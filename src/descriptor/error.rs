@@ -10,6 +10,8 @@ pub enum Error {
     MissingPublicKey,
     MissingDetails,
 
+    InvalidDescriptorCharacter(char),
+
     CantDeriveWithMiniscript,
 
     BIP32(bitcoin::util::bip32::Error),

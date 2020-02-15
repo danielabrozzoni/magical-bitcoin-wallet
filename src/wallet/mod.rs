@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::cmp;
+use std::str::FromStr;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io::{Read, Write};
@@ -25,7 +26,7 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy};
+use crate::descriptor::{DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy, get_checksum};
 use crate::error::Error;
 use crate::psbt::{utils::PSBTUtils, PSBTSatisfier, PSBTSigner};
 use crate::signer::Signer;
@@ -38,7 +39,6 @@ use electrum_client::Client;
 #[cfg(not(any(feature = "electrum", feature = "default")))]
 use std::marker::PhantomData as Client;
 
-// TODO: force descriptor and change_descriptor to have the same policies
 pub struct Wallet<S: Read + Write, D: BatchDatabase> {
     descriptor: ExtendedDescriptor,
     change_descriptor: Option<ExtendedDescriptor>,
@@ -56,12 +56,24 @@ where
     D: BatchDatabase,
 {
     pub fn new_offline(
-        descriptor: ExtendedDescriptor,
-        change_descriptor: Option<ExtendedDescriptor>,
+        descriptor: &str,
+        change_descriptor: Option<&str>,
         network: Network,
-        database: D,
-    ) -> Self {
-        Wallet {
+        mut database: D,
+    ) -> Result<Self, Error> {
+        database.check_descriptor_checksum(ScriptType::External, get_checksum(descriptor)?.as_bytes())?;
+        let descriptor = ExtendedDescriptor::from_str(descriptor)?;
+        let change_descriptor = match change_descriptor {
+            Some(desc) => {
+                database.check_descriptor_checksum(ScriptType::Internal, get_checksum(desc)?.as_bytes())?;
+                Some(ExtendedDescriptor::from_str(desc)?)
+            }
+            None => None,
+        };
+
+        // TODO: make sure that both descriptor have the same structure
+
+        Ok(Wallet {
             descriptor,
             change_descriptor,
             network,
@@ -69,7 +81,7 @@ where
             client: None,
             database: RefCell::new(database),
             _secp: Secp256k1::gen_new(),
-        }
+        })
     }
 
     pub fn get_new_address(&self) -> Result<Address, Error> {
@@ -653,13 +665,25 @@ where
     D: BatchDatabase,
 {
     pub fn new(
-        descriptor: ExtendedDescriptor,
-        change_descriptor: Option<ExtendedDescriptor>,
+        descriptor: &str,
+        change_descriptor: Option<&str>,
         network: Network,
-        database: D,
+        mut database: D,
         client: Client<S>,
-    ) -> Self {
-        Wallet {
+    ) -> Result<Self, Error> {
+        database.check_descriptor_checksum(ScriptType::External, get_checksum(descriptor)?.as_bytes())?;
+        let descriptor = ExtendedDescriptor::from_str(descriptor)?;
+        let change_descriptor = match change_descriptor {
+            Some(desc) => {
+                database.check_descriptor_checksum(ScriptType::Internal, get_checksum(desc)?.as_bytes())?;
+                Some(ExtendedDescriptor::from_str(desc)?)
+            }
+            None => None,
+        };
+
+        // TODO: make sure that both descriptor have the same structure
+
+        Ok(Wallet {
             descriptor,
             change_descriptor,
             network,
@@ -667,7 +691,7 @@ where
             client: Some(RefCell::new(client)),
             database: RefCell::new(database),
             _secp: Secp256k1::gen_new(),
-        }
+        })
     }
 
     fn get_previous_output(&self, outpoint: &OutPoint) -> Option<TxOut> {
