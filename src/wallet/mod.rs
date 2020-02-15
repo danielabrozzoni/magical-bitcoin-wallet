@@ -116,7 +116,6 @@ where
         utxos: Option<Vec<OutPoint>>,
         unspendable: Option<Vec<OutPoint>>,
     ) -> Result<(PSBT, TransactionDetails), Error> {
-        // TODO: run before deriving the descriptor
         let policy = self.descriptor.extract_policy().unwrap();
         if policy.requires_path() && policy_path.is_none() {
             return Err(Error::SpendingPolicyRequired);
@@ -287,6 +286,7 @@ where
 
     // TODO: define an enum for signing errors
     pub fn sign(&self, mut psbt: PSBT) -> Result<(PSBT, bool), Error> {
+        let policy = self.descriptor.extract_policy().unwrap();
         let mut derived_descriptors = BTreeMap::new();
 
         let tx = &psbt.global.unsigned_tx;

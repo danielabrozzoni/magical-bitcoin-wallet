@@ -20,10 +20,14 @@ pub mod policy;
 
 pub use self::error::Error;
 pub use self::extended_key::{DerivationIndex, DescriptorExtendedKey};
-pub use self::policy::{ExtractPolicy, Policy};
+pub use self::policy::Policy;
 
 trait MiniscriptExtractPolicy {
     fn extract_policy(&self, lookup_map: &BTreeMap<String, Box<dyn Key>>) -> Option<Policy>;
+}
+
+pub trait ExtractPolicy {
+    fn extract_policy(&self) -> Option<Policy>;
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Default)]
@@ -105,6 +109,10 @@ trait Key: std::fmt::Debug {
     fn xprv(&self) -> Option<ExtendedPrivKey>;
     fn full_path(&self, index: u32) -> Option<DerivationPath>;
     fn is_fixed(&self) -> bool;
+
+    fn has_secret(&self) -> bool {
+        self.xprv().is_some() || self.as_secret_key().is_some()
+    }
 }
 
 impl Key for PublicKey {
