@@ -121,19 +121,38 @@ impl Satisfaction {
     }
 }
 
-impl std::ops::Add for Satisfaction {
-    type Output = Self;
+impl<'a> std::ops::Add<&'a Satisfaction> for Satisfaction {
+    type Output = Satisfaction;
 
-    fn add(self, other: Self) -> Self {
+    fn add(self, other: &'a Satisfaction) -> Satisfaction {
+        &self + other
+    }
+}
+
+impl<'a, 'b> std::ops::Add<&'b Satisfaction> for &'a Satisfaction {
+    type Output = Satisfaction;
+
+    fn add(self, other: &'b Satisfaction) -> Satisfaction {
         match (self, other) {
+            // complete-complete
+            (
+                Satisfaction::Complete { condition: mut a },
+                Satisfaction::Complete { condition: b },
+            ) => {
+                a.merge(&b).unwrap();
+                Satisfaction::Complete { condition: a }
+            }
             // complete-<any>
-            // Assume that both would have the same PathRequirement, which seems reasonable
-            (Satisfaction::Complete { condition }, _) => Satisfaction::Complete { condition },
-            (_, Satisfaction::Complete { condition }) => Satisfaction::Complete { condition },
+            (Satisfaction::Complete { condition }, _) => Satisfaction::Complete {
+                condition: *condition,
+            },
+            (_, Satisfaction::Complete { condition }) => Satisfaction::Complete {
+                condition: *condition,
+            },
 
             // none-<any>
-            (Satisfaction::None, any) => any,
-            (any, Satisfaction::None) => any,
+            (Satisfaction::None, any) => any.clone(),
+            (any, Satisfaction::None) => any.clone(),
 
             // partial-partial
             (
@@ -151,7 +170,7 @@ impl std::ops::Add for Satisfaction {
                 let union: HashSet<_> = a_items.union(&b_items).cloned().collect();
                 Satisfaction::Partial {
                     m: union.len(),
-                    n: a_n,
+                    n: *a_n,
                     completed: union,
                 }
             }
@@ -190,6 +209,8 @@ impl PathRequirements {
         }?;
 
         match (self.timelock, other.timelock) {
+            // TODO: we could actually set the timelock to the highest of the two, but we would
+            // have to first check that they are both in the same "unit" (blocks vs time)
             (Some(old), Some(new)) if old != new => Err(PolicyError::DifferentTimelock(old, new)),
             _ => {
                 self.timelock = self.timelock.or(other.timelock);
@@ -239,39 +260,21 @@ impl Policy {
         }
     }
 
-    pub fn make_thresh(items: Vec<Policy>, mut threshold: usize) -> Option<Policy> {
+    pub fn make_thresh(items: Vec<Policy>, threshold: usize) -> Option<Policy> {
         if threshold == 0 {
             return None;
         }
 
-        let completed: HashSet<_> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| match x.contribution {
-                Satisfaction::Complete { .. } => true,
-                _ => false,
-            })
-            .map(|(k, _)| k)
-            .collect();
-        let path_req = items
-            .iter()
-            .filter_map(|x| match x.contribution {
-                Satisfaction::Complete { condition } => Some(condition),
-                _ => None,
-            })
-            .fold(PathRequirements::default(), |mut acc, x| {
-                acc.merge(&x).unwrap();
-                acc
-            });
-
+        let contribution = items.iter().fold(
+            Satisfaction::Partial {
+                m: 0,
+                n: threshold,
+                completed: HashSet::new(),
+            },
+            |acc, x| acc + &x.contribution,
+        );
         let mut policy: Policy = SatisfiableItem::Thresh { items, threshold }.into();
-        if completed.len() >= threshold {
-            policy.contribution = Satisfaction::Complete {
-                condition: path_req,
-            };
-        } else {
-            policy.contribution = Satisfaction::from_items_threshold(completed, threshold);
-        }
+        policy.contribution = contribution;
 
         Some(policy)
     }
