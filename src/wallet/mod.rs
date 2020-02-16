@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 use std::cmp;
-use std::str::FromStr;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io::{Read, Write};
+use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::blockdata::opcodes;
@@ -26,7 +26,7 @@ pub mod utils;
 
 use self::utils::{ChunksIterator, IsDust};
 use crate::database::{BatchDatabase, BatchOperations};
-use crate::descriptor::{DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy, get_checksum};
+use crate::descriptor::{get_checksum, DescriptorMeta, ExtendedDescriptor, ExtractPolicy, Policy};
 use crate::error::Error;
 use crate::psbt::{utils::PSBTUtils, PSBTSatisfier, PSBTSigner};
 use crate::signer::Signer;
@@ -61,11 +61,17 @@ where
         network: Network,
         mut database: D,
     ) -> Result<Self, Error> {
-        database.check_descriptor_checksum(ScriptType::External, get_checksum(descriptor)?.as_bytes())?;
+        database.check_descriptor_checksum(
+            ScriptType::External,
+            get_checksum(descriptor)?.as_bytes(),
+        )?;
         let descriptor = ExtendedDescriptor::from_str(descriptor)?;
         let change_descriptor = match change_descriptor {
             Some(desc) => {
-                database.check_descriptor_checksum(ScriptType::Internal, get_checksum(desc)?.as_bytes())?;
+                database.check_descriptor_checksum(
+                    ScriptType::Internal,
+                    get_checksum(desc)?.as_bytes(),
+                )?;
                 Some(ExtendedDescriptor::from_str(desc)?)
             }
             None => None,
@@ -671,11 +677,17 @@ where
         mut database: D,
         client: Client<S>,
     ) -> Result<Self, Error> {
-        database.check_descriptor_checksum(ScriptType::External, get_checksum(descriptor)?.as_bytes())?;
+        database.check_descriptor_checksum(
+            ScriptType::External,
+            get_checksum(descriptor)?.as_bytes(),
+        )?;
         let descriptor = ExtendedDescriptor::from_str(descriptor)?;
         let change_descriptor = match change_descriptor {
             Some(desc) => {
-                database.check_descriptor_checksum(ScriptType::Internal, get_checksum(desc)?.as_bytes())?;
+                database.check_descriptor_checksum(
+                    ScriptType::Internal,
+                    get_checksum(desc)?.as_bytes(),
+                )?;
                 Some(ExtendedDescriptor::from_str(desc)?)
             }
             None => None,

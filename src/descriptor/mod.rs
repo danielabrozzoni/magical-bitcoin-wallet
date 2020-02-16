@@ -16,15 +16,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::psbt::utils::PSBTUtils;
 
+pub mod checksum;
 pub mod error;
 pub mod extended_key;
 pub mod policy;
-pub mod checksum;
 
+pub use self::checksum::get_checksum;
 pub use self::error::Error;
 pub use self::extended_key::{DerivationIndex, DescriptorExtendedKey};
 pub use self::policy::Policy;
-pub use self::checksum::get_checksum;
 
 trait MiniscriptExtractPolicy {
     fn extract_policy(&self, lookup_map: &BTreeMap<String, Box<dyn Key>>) -> Option<Policy>;

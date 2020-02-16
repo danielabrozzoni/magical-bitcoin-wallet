@@ -238,7 +238,11 @@ impl BatchOperations for Batch {
 }
 
 impl Database for Tree {
-    fn check_descriptor_checksum<B: AsRef<[u8]>>(&mut self, script_type: ScriptType, bytes: B) -> Result<(), Error> {
+    fn check_descriptor_checksum<B: AsRef<[u8]>>(
+        &mut self,
+        script_type: ScriptType,
+        bytes: B,
+    ) -> Result<(), Error> {
         let key = SledKey::DescriptorChecksum(script_type).as_sled_key();
 
         let prev = self.get(&key)?.map(|x| x.to_vec());
@@ -385,7 +389,7 @@ impl Database for Tree {
 
                     val + 1
                 }
-                None => 0
+                None => 0,
             };
 
             Some(new.to_be_bytes().to_vec())

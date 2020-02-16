@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
 
@@ -96,47 +96,65 @@ impl SatisfiableItem {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "UPPERCASE")]
 pub enum Satisfaction {
-    Full,
-    After(u32),
-    Partial,
-    None,
-    Unknown,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize)]
-pub enum Contribution {
-    Final,
-    Partial,
+    Complete {
+        #[serde(skip_serializing_if = "PathRequirements::is_null")]
+        condition: PathRequirements,
+    },
+    Partial {
+        m: usize,
+        n: usize,
+        completed: HashSet<usize>,
+    },
     None,
 }
 
-impl Contribution {
-    fn from_items_threshold(items: usize, threshold: usize) -> Self {
-        if items >= threshold {
-            Contribution::Final
-        } else if items > 0 {
-            Contribution::Partial
-        } else {
-            Contribution::None
+impl Satisfaction {
+    fn from_items_threshold(items: HashSet<usize>, threshold: usize) -> Satisfaction {
+        Satisfaction::Partial {
+            m: items.len(),
+            n: threshold,
+            completed: items,
         }
     }
+}
 
-    fn from_finals_partials(finals: usize, partials: usize, threshold: usize) -> Self {
-        if finals >= threshold {
-            Contribution::Final
-        } else if finals + partials > 0 {
-            Contribution::Partial
-        } else {
-            Contribution::None
-        }
-    }
+impl std::ops::Add for Satisfaction {
+    type Output = Self;
 
-    fn from_bool(val: bool) -> Self {
-        match val {
-            true => Contribution::Final,
-            false => Contribution::Partial,
+    fn add(self, other: Self) -> Self {
+        match (self, other) {
+            // complete-<any>
+            // Assume that both would have the same PathRequirement, which seems reasonable
+            (Satisfaction::Complete { condition }, _) => Satisfaction::Complete { condition },
+            (_, Satisfaction::Complete { condition }) => Satisfaction::Complete { condition },
+
+            // none-<any>
+            (Satisfaction::None, any) => any,
+            (any, Satisfaction::None) => any,
+
+            // partial-partial
+            (
+                Satisfaction::Partial {
+                    m: _,
+                    n: a_n,
+                    completed: a_items,
+                },
+                Satisfaction::Partial {
+                    m: _,
+                    n: _,
+                    completed: b_items,
+                },
+            ) => {
+                let union: HashSet<_> = a_items.union(&b_items).cloned().collect();
+                Satisfaction::Partial {
+                    m: union.len(),
+                    n: a_n,
+                    completed: union,
+                }
+            }
         }
     }
 }
@@ -146,12 +164,14 @@ pub struct Policy {
     #[serde(flatten)]
     item: SatisfiableItem,
     satisfaction: Satisfaction,
-    contribution: Contribution,
+    contribution: Satisfaction,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Eq, PartialEq, Clone, Copy, Serialize)]
 pub struct PathRequirements {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub csv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timelock: Option<u32>,
 }
 
@@ -198,8 +218,8 @@ impl Policy {
     pub fn new(item: SatisfiableItem) -> Self {
         Policy {
             item,
-            satisfaction: Satisfaction::Unknown,
-            contribution: Contribution::None,
+            satisfaction: Satisfaction::None,
+            contribution: Satisfaction::None,
         }
     }
 
@@ -223,20 +243,38 @@ impl Policy {
         if threshold == 0 {
             return None;
         }
-        if threshold > items.len() {
+        if items.len() > threshold {
             threshold = items.len();
         }
 
-        let finals = items
+        let completed: HashSet<_> = items
             .iter()
-            .filter(|x| x.contribution == Contribution::Final)
-            .count();
-        let partials = items
+            .enumerate()
+            .filter(|(_, x)| match x.contribution {
+                Satisfaction::Complete { .. } => true,
+                _ => false,
+            })
+            .map(|(k, _)| k)
+            .collect();
+        let path_req = items
             .iter()
-            .filter(|x| x.contribution == Contribution::Partial)
-            .count();
+            .filter_map(|x| match x.contribution {
+                Satisfaction::Complete { condition } => Some(condition),
+                _ => None,
+            })
+            .fold(PathRequirements::default(), |mut acc, x| {
+                acc.merge(&x).unwrap();
+                acc
+            });
+
         let mut policy: Policy = SatisfiableItem::Thresh { items, threshold }.into();
-        policy.contribution = Contribution::from_finals_partials(finals, partials, threshold);
+        if completed.len() >= threshold {
+            policy.contribution = Satisfaction::Complete {
+                condition: path_req,
+            };
+        } else {
+            policy.contribution = Satisfaction::from_items_threshold(completed, threshold);
+        }
 
         Some(policy)
     }
@@ -250,9 +288,11 @@ impl Policy {
         .into();
         let our_keys = keys
             .iter()
-            .filter(|x| x.is_some() && x.unwrap().has_secret())
-            .count();
-        policy.contribution = Contribution::from_items_threshold(our_keys, threshold);
+            .enumerate()
+            .filter(|(_, x)| x.is_some() && x.unwrap().has_secret())
+            .map(|(k, _)| k)
+            .collect();
+        policy.contribution = Satisfaction::from_items_threshold(our_keys, threshold);
 
         Some(policy)
     }
@@ -345,7 +385,13 @@ impl From<SatisfiableItem> for Policy {
 fn signature_from_string(key: Option<&Box<dyn Key>>) -> Option<Policy> {
     key.map(|k| {
         let mut policy: Policy = SatisfiableItem::Signature(PKOrF::from_key(k)).into();
-        policy.contribution = Contribution::from_bool(k.has_secret());
+        policy.contribution = if k.has_secret() {
+            Satisfaction::Complete {
+                condition: Default::default(),
+            }
+        } else {
+            Satisfaction::None
+        };
 
         policy
     })
@@ -368,7 +414,13 @@ fn signature_key_from_string(key: Option<&Box<dyn Key>>) -> Option<Policy> {
             }
         }
         .into();
-        policy.contribution = Contribution::from_bool(k.has_secret());
+        policy.contribution = if k.has_secret() {
+            Satisfaction::Complete {
+                condition: Default::default(),
+            }
+        } else {
+            Satisfaction::None
+        };
 
         policy
     })
@@ -382,10 +434,26 @@ impl MiniscriptExtractPolicy for Miniscript<String> {
             Terminal::Pk(pubkey) => signature_from_string(lookup_map.get(pubkey)),
             Terminal::PkH(pubkey_hash) => signature_key_from_string(lookup_map.get(pubkey_hash)),
             Terminal::After(value) => {
-                Some(SatisfiableItem::AbsoluteTimelock { value: *value }.into())
+                let mut policy: Policy = SatisfiableItem::AbsoluteTimelock { value: *value }.into();
+                policy.contribution = Satisfaction::Complete {
+                    condition: PathRequirements {
+                        csv: None,
+                        timelock: Some(*value),
+                    },
+                };
+
+                Some(policy)
             }
             Terminal::Older(value) => {
-                Some(SatisfiableItem::RelativeTimelock { value: *value }.into())
+                let mut policy: Policy = SatisfiableItem::RelativeTimelock { value: *value }.into();
+                policy.contribution = Satisfaction::Complete {
+                    condition: PathRequirements {
+                        csv: Some(*value),
+                        timelock: None,
+                    },
+                };
+
+                Some(policy)
             }
             Terminal::Sha256(hash) => Some(SatisfiableItem::SHA256Preimage { hash: *hash }.into()),
             Terminal::Hash256(hash) => {

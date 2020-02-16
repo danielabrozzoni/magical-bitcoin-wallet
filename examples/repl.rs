@@ -232,11 +232,8 @@ fn main() {
         Some("testnet") | _ => Network::Testnet,
     };
 
-    let descriptor = matches
-        .value_of("descriptor")
-        .unwrap();
-    let change_descriptor = matches
-        .value_of("change_descriptor");
+    let descriptor = matches.value_of("descriptor").unwrap();
+    let change_descriptor = matches.value_of("change_descriptor");
     debug!("descriptors: {:?} {:?}", descriptor, change_descriptor);
 
     let database = sled::open(prepare_home_dir().to_str().unwrap()).unwrap();
