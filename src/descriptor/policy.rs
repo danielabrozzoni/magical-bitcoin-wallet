@@ -243,9 +243,6 @@ impl Policy {
         if threshold == 0 {
             return None;
         }
-        if items.len() > threshold {
-            threshold = items.len();
-        }
 
         let completed: HashSet<_> = items
             .iter()
