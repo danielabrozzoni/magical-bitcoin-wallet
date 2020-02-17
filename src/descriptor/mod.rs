@@ -267,7 +267,7 @@ impl ExtendedDescriptor {
         &self,
         miniscript: Miniscript<PublicKey>,
     ) -> Result<DerivedDescriptor, Error> {
-        // TODO: make sure they are "equivalent"
+        // TODO: make sure `miniscript` is a derivation of `self`
         match self.internal {
             Descriptor::Bare(_) => Ok(Descriptor::Bare(miniscript)),
             Descriptor::Sh(_) => Ok(Descriptor::Sh(miniscript)),

@@ -16,7 +16,7 @@ use bitcoin::{
     Address, Network, OutPoint, PublicKey, Script, SigHashType, Transaction, TxIn, TxOut, Txid,
 };
 
-use miniscript::BitcoinSig;
+use miniscript::{BitcoinSig, Descriptor, Terminal};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -300,9 +300,38 @@ where
         Ok((psbt, transaction_details))
     }
 
-    // TODO: define an enum for signing errors
-    pub fn sign(&self, mut psbt: PSBT) -> Result<(PSBT, bool), Error> {
-        let tx = &psbt.global.unsigned_tx;
+    pub fn psbt_status(&self, psbt: PSBT) -> Result<Vec<Option<Policy>>, Error> {
+        let policy = self.descriptor.extract_policy();
+        Ok(psbt
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(n, input)| {
+                let satisfier = PSBTSatisfier::new(&input, None, None);
+                let mut input_policy = policy.clone();
+                if let Some(policy) = &mut input_policy {
+                    if let Ok(desc) = self.descriptor.derive_from_psbt_input(&psbt, n) {
+                        let root = match desc {
+                            Descriptor::Pk(pubkey)
+                            | Descriptor::Pkh(pubkey)
+                            | Descriptor::Wpkh(pubkey)
+                            | Descriptor::ShWpkh(pubkey) => Terminal::Pk(pubkey),
+                            Descriptor::Bare(inner)
+                            | Descriptor::Sh(inner)
+                            | Descriptor::Wsh(inner)
+                            | Descriptor::ShWsh(inner) => inner.node
+                        };
+                        policy.satisfy(&satisfier, &root);
+                    }
+                }
+
+                input_policy
+            })
+            .collect())
+    }
+
+    // TODO: move down to the "internals"
+    fn add_hd_keypaths(&self, psbt: &mut PSBT) -> Result<(), Error> {
         let mut input_utxos = Vec::with_capacity(psbt.inputs.len());
         for n in 0..psbt.inputs.len() {
             input_utxos.push(psbt.get_utxo_for(n).clone());
@@ -338,6 +367,16 @@ where
                 psbt_input.hd_keypaths.append(&mut hd_keypaths);
             }
         }
+
+        Ok(())
+    }
+
+    // TODO: define an enum for signing errors
+    pub fn sign(&self, mut psbt: PSBT) -> Result<(PSBT, bool), Error> {
+        // this helps us doing our job later
+        self.add_hd_keypaths(&mut psbt)?;
+
+        let tx = &psbt.global.unsigned_tx;
 
         let mut signer = PSBTSigner::from_descriptor(&psbt.global.unsigned_tx, &self.descriptor)?;
         if let Some(desc) = &self.change_descriptor {

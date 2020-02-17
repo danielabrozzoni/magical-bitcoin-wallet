@@ -160,6 +160,18 @@ fn main() {
                         .takes_value(true)
                         .number_of_values(1)
                         .required(true),
+                ))
+        .subcommand(
+            SubCommand::with_name("psbt_status")
+                .about("Returns the current satisfaction status for a PSBT")
+                .arg(
+                    Arg::with_name("psbt")
+                        .long("psbt")
+                        .value_name("BASE64_PSBT")
+                        .help("Sets the PSBT to sign")
+                        .takes_value(true)
+                        .number_of_values(1)
+                        .required(true),
                 ));
 
     let mut repl_app = app.clone().setting(AppSettings::NoBinaryName);
@@ -304,12 +316,17 @@ fn main() {
             let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
             let (psbt, finalized) = wallet.sign(psbt).unwrap();
 
+            println!("PSBT: {}", base64::encode(&serialize(&psbt)));
             println!("Finalized: {}", finalized);
             if finalized {
                 println!("Extracted: {}", serialize_hex(&psbt.extract_tx()));
-            } else {
-                println!("PSBT: {}", base64::encode(&serialize(&psbt)));
             }
+        } else if let Some(sub_matches) = matches.subcommand_matches("psbt_status") {
+            let psbt = base64::decode(sub_matches.value_of("psbt").unwrap()).unwrap();
+            let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
+            let policy = wallet.psbt_status(psbt).unwrap();
+
+            println!("Finalized: {}", serde_json::to_string(&policy).unwrap());
         }
     };
 
